@@ -1,0 +1,45 @@
+{
+  "robot_client_script": "../run_lerobot_robot_client.sh",
+  "host": "0.0.0.0",
+  "port": 8000,
+  "camera_fps": 15,
+  "camera_width": 640,
+  "camera_height": 480,
+  "jpeg_quality": 75,
+  "policy_camera_keys": ["front", "left"],
+  "cameras": [
+    {
+      "key": "left",
+      "title": "LEFT ARM",
+      "serial": "260322274992"
+    },
+    {
+      "key": "front",
+      "title": "HEAD",
+      "serial": "260322274450"
+    },
+    {
+      "key": "right",
+      "title": "RIGHT ARM",
+      "serial": "260322276006"
+    }
+  ],
+  "displayed_task": "Put the dish into the dish box with the left arm.",
+  "displayed_model": "pi0",
+  "web_version": "web-v2",
+  "default_task_id": "dish",
+  "tasks": [
+    {
+      "id": "dish",
+      "number": 1,
+      "label": "DISH",
+      "instruction": "Put the dish into the dish box with the left arm."
+    },
+    {
+      "id": "cup",
+      "number": 2,
+      "label": "CUP",
+      "instruction": "Pick up the cup with the left arm."
+    }
+  ]
+}

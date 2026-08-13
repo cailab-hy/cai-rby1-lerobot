@@ -1,0 +1,25 @@
+{
+  "robot_client_script": "../run_lerobot_robot_client.sh",
+  "camera_fps": 15,
+  "camera_width": 640,
+  "camera_height": 480,
+  "cameras": [
+    {
+      "key": "left",
+      "title": "LEFT ARM",
+      "serial": "260322274992"
+    },
+    {
+      "key": "front",
+      "title": "HEAD",
+      "serial": "260322274450"
+    },
+    {
+      "key": "right",
+      "title": "RIGHT ARM",
+      "serial": "260322276006"
+    }
+  ],
+  "displayed_task": "Put the dish into the dish box with the left arm.",
+  "displayed_model": "pi0"
+}
