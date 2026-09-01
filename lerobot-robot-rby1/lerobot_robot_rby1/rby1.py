@@ -44,23 +44,25 @@ from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnected
 
 from . import command_builders as cb
 from . import model_probe
-from .config_rby1 import Rby1Config
+from .config_rby1 import (
+    READY_HEAD,
+    READY_LEFT,
+    READY_POSE,
+    READY_RIGHT,
+    Rby1Config,
+    ready_pose_for_version,
+)
 from .constants import (
     ARM_DOF,
     BASE_VEL_NAMES,
     LEFT_ARM_NAMES,
     LEFT_EE_NAMES,
-    READY_HEAD,
-    READY_LEFT,
-    READY_POSE,
-    READY_RIGHT,
     RIGHT_ARM_NAMES,
     RIGHT_EE_NAMES,
     TORSO_DOF,
     TORSO_EE_NAMES,
     TORSO_NAMES,
     TOTAL_BODY_DOF,
-    ready_pose_for_version,
 )
 from .gripper import Rby1Gripper
 
@@ -139,13 +141,6 @@ class Rby1(Robot):
         self._ready_right: np.ndarray = READY_RIGHT
         self._ready_left: np.ndarray = READY_LEFT
         self._ready_head: np.ndarray = READY_HEAD
-        # Per-call I/O timings are exposed to the async client for its JSONL
-        # diagnostics.  Keeping these out of observations/actions avoids
-        # changing the policy feature schema.
-        self._last_observation_timings_ms: dict[str, float] = {}
-        self._last_action_timings_ms: dict[str, float] = {}
-        self._last_command_timings_ms: dict[str, float] = {}
-        self._last_gripper_action_timings_ms: dict[str, float] = {}
 
     # ------------------------------------------------------------------ #
     #  Properties                                                          #
@@ -163,16 +158,6 @@ class Rby1(Robot):
     def is_calibrated(self) -> bool:
         # RB-Y1 uses absolute encoders - no calibration required.
         return True
-
-    @property
-    def last_observation_timings_ms(self) -> dict[str, float]:
-        """Timing breakdown for the most recent :meth:`get_observation` call."""
-        return self._last_observation_timings_ms.copy()
-
-    @property
-    def last_action_timings_ms(self) -> dict[str, float]:
-        """Timing breakdown for the most recent :meth:`send_action` call."""
-        return self._last_action_timings_ms.copy()
 
     # ------------------------------------------------------------------ #
     #  Features                                                            #
@@ -550,17 +535,11 @@ class Rby1(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        total_start = time.perf_counter()
-        timings: dict[str, float] = {}
-
-        started = time.perf_counter()
         state = self._robot.get_state()
-        timings["robot_get_state"] = (time.perf_counter() - started) * 1000
         model = self._model
         obs: dict[str, Any] = {}
 
         # Joint positions (and optional velocities / torques) per enabled group.
-        started = time.perf_counter()
         self._read_group(obs, state.position, model, "")
         if self._config.use_velocity:
             self._read_group(obs, state.velocity, model, ".vel")
@@ -569,27 +548,20 @@ class Rby1(Robot):
 
         # End-effector poses (EE mode): forward kinematics of the enabled groups.
         self._read_ee_observation(obs, state)
-        timings["state_decode_and_fk"] = (time.perf_counter() - started) * 1000
 
         # Grippers. Dataset convention is 1.0 = open, 0.0 = closed; Rby1Gripper
-        # reports 0 = open, 1 = closed, so the right side is flipped here.
+        # reports 0 = open, 1 = closed, so both sides are flipped here.
         if self._config.use_gripper and self._gripper is not None:
-            started = time.perf_counter()
             gripper_pos = self._gripper.get_positions()  # [right, left], 0=open 1=closed
-            timings["gripper_get_positions"] = (time.perf_counter() - started) * 1000
             if self._config.use_right_arm:
                 obs["right_gripper_0"] = 1.0 - float(gripper_pos[0])
             if self._config.use_left_arm:
-                obs["left_gripper_0"] = float(gripper_pos[1])
+                obs["left_gripper_0"] = 1.0 - float(gripper_pos[1])
 
         # Cameras.
         for cam_key, cam in self.cameras.items():
-            started = time.perf_counter()
             obs[cam_key] = cam.async_read()
-            timings[f"camera_{cam_key}_async_read"] = (time.perf_counter() - started) * 1000
 
-        timings["total"] = (time.perf_counter() - total_start) * 1000
-        self._last_observation_timings_ms = timings
         return obs
 
     def _read_group(
@@ -653,34 +625,11 @@ class Rby1(Robot):
         except ImportError as e:
             raise ImportError("rby1_sdk is required.") from e
 
-        total_start = time.perf_counter()
-        self._last_command_timings_ms = {}
-        self._last_gripper_action_timings_ms = {}
-
-        command_start = time.perf_counter()
         if self._config.action_mode == "ee":
             self._send_ee_action(rby, action)
         else:
             self._send_joint_action(rby, action)
-        command_ms = (time.perf_counter() - command_start) * 1000
-
-        gripper_start = time.perf_counter()
         self._send_gripper_action(action)
-        gripper_ms = (time.perf_counter() - gripper_start) * 1000
-
-        self._last_action_timings_ms = {
-            "robot_command": command_ms,
-            "gripper_command": gripper_ms,
-            "total": (time.perf_counter() - total_start) * 1000,
-            **{
-                f"robot_command_{key}": value
-                for key, value in self._last_command_timings_ms.items()
-            },
-            **{
-                f"gripper_command_{key}": value
-                for key, value in self._last_gripper_action_timings_ms.items()
-            },
-        }
         return action
 
     def _send_joint_action(self, rby: Any, action: dict[str, Any]) -> None:
@@ -708,8 +657,6 @@ class Rby1(Robot):
         # Compose the per-tick command: enabled arms (held limbs are omitted)
         # plus the optional mobile-base velocity. Both ride the same priority-1
         # stream so they are applied atomically.
-        timings: dict[str, float] = {}
-        started = time.perf_counter()
         body, has_body = cb.build_body_command(
             rby,
             self._config,
@@ -719,9 +666,6 @@ class Rby1(Robot):
             self._max_qddot,
             minimum_time,
         )
-        timings["build_body_command"] = (time.perf_counter() - started) * 1000
-
-        started = time.perf_counter()
         cbc = rby.ComponentBasedCommandBuilder()
         if has_body:
             cbc.set_body_command(body)
@@ -730,14 +674,9 @@ class Rby1(Robot):
             cbc.set_mobility_command(
                 cb.build_mobility_command(rby, linear, angular, minimum_time)
             )
-        timings["build_component_command"] = (time.perf_counter() - started) * 1000
-
-        started = time.perf_counter()
         self._stream.send_command(
             rby.RobotCommandBuilder().set_command(cbc)
         )
-        timings["stream_send_command"] = (time.perf_counter() - started) * 1000
-        self._last_command_timings_ms = timings
 
     def _send_ee_action(self, rby: Any, action: dict[str, Any]) -> None:
         """Execute an end-effector pose action (``action_mode="ee"``).
@@ -821,32 +760,18 @@ class Rby1(Robot):
         """
         if not self._config.use_gripper or self._gripper is None:
             return
-        total_start = time.perf_counter()
-        started = time.perf_counter()
         current_gripper = self._gripper.get_positions()
-        get_positions_ms = (time.perf_counter() - started) * 1000
-
-        started = time.perf_counter()
         gripper_target = np.array(
             [
                 1.0 - action.get("right_gripper_0", 1.0)
                 if self._config.use_right_arm
                 else current_gripper[0],
-                action.get("left_gripper_0", 1.0)
+                1.0 - action.get("left_gripper_0", 1.0)
                 if self._config.use_left_arm
                 else current_gripper[1],
             ]
         )
-        build_target_ms = (time.perf_counter() - started) * 1000
-
-        started = time.perf_counter()
         self._gripper.set_positions(gripper_target)
-        self._last_gripper_action_timings_ms = {
-            "get_positions": get_positions_ms,
-            "build_target": build_target_ms,
-            "set_positions": (time.perf_counter() - started) * 1000,
-            "total": (time.perf_counter() - total_start) * 1000,
-        }
 
     @staticmethod
     def _base_velocity_from_action(action: dict[str, Any]) -> tuple[np.ndarray, float]:

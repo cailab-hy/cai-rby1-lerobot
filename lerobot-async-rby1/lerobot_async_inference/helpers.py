@@ -20,8 +20,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import cv2
-import numpy as np
 import torch
 
 from lerobot.configs import PolicyFeature
@@ -50,61 +48,6 @@ LeRobotObservation = dict[str, torch.Tensor]
 
 # observation, ready for policy inference (image keys resized)
 Observation = dict[str, torch.Tensor]
-
-
-def resize_image_by_scale(
-    image: np.ndarray,
-    scale: float,
-) -> np.ndarray:
-    """Resize an HW/HWC image by one scale factor, without cropping or padding."""
-    if not isinstance(image, np.ndarray) or image.ndim not in (2, 3):
-        raise ValueError(
-            "Expected an HW or HWC numpy image, got "
-            f"{type(image)!r} / {getattr(image, 'shape', None)}"
-        )
-    if image.shape[0] <= 0 or image.shape[1] <= 0:
-        raise ValueError(f"Image dimensions must be positive, got {image.shape}")
-    if scale <= 0:
-        raise ValueError(f"Image resize scale must be positive, got {scale}")
-
-    source_height, source_width = image.shape[:2]
-    resized_width = max(1, round(source_width * scale))
-    resized_height = max(1, round(source_height * scale))
-
-    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-    return cv2.resize(
-        image,
-        (resized_width, resized_height),
-        interpolation=interpolation,
-    )
-
-
-def scale_lerobot_image_features(
-    lerobot_features: dict[str, dict],
-    scale: float,
-) -> dict[str, dict]:
-    """Return a copy whose image feature shapes match the transport resolution."""
-    if scale <= 0:
-        raise ValueError(f"Image resize scale must be positive, got {scale}")
-
-    scaled_features = {
-        key: dict(feature) if isinstance(feature, dict) else feature
-        for key, feature in lerobot_features.items()
-    }
-    if scale == 1.0:
-        return scaled_features
-
-    for feature in scaled_features.values():
-        if not isinstance(feature, dict) or feature.get("dtype") not in {"image", "video"}:
-            continue
-        height, width, channels = feature["shape"]
-        feature["shape"] = (
-            max(1, round(height * scale)),
-            max(1, round(width * scale)),
-            channels,
-        )
-
-    return scaled_features
 
 
 def visualize_action_queue_size(action_queue_size: list[int]) -> None:
@@ -147,16 +90,10 @@ def raw_observation_to_observation(
     raw_observation: RawObservation,
     lerobot_features: dict[str, dict],
     policy_image_features: dict[str, PolicyFeature],
-    resize_images: bool = True,
 ) -> Observation:
     observation = {}
 
-    observation = prepare_raw_observation(
-        raw_observation,
-        lerobot_features,
-        policy_image_features,
-        resize_images=resize_images,
-    )
+    observation = prepare_raw_observation(raw_observation, lerobot_features, policy_image_features)
     for k, v in observation.items():
         if isinstance(v, torch.Tensor):  # VLAs present natural-language instructions in observations
             if "image" in k:
@@ -208,7 +145,6 @@ def prepare_raw_observation(
     robot_obs: RawObservation,
     lerobot_features: dict[str, dict],
     policy_image_features: dict[str, PolicyFeature],
-    resize_images: bool = True,
 ) -> Observation:
     """Matches keys from the raw robot_obs dict to the keys expected by a given policy (passed as
     policy_image_features)."""
@@ -220,22 +156,16 @@ def prepare_raw_observation(
     image_keys = list(filter(is_image_key, lerobot_obs))
     # state's shape is expected as (B, state_dim)
     state_dict = {OBS_STATE: extract_state_from_raw_observation(lerobot_obs)}
-    if resize_images:
-        # Turns image features into (C, H, W), matching the policy-declared
-        # feature shape. This is retained for clients that send raw images.
-        image_dict = {
-            key: resize_robot_observation_image(
-                torch.tensor(lerobot_obs[key]), policy_image_features[key].shape
-            )
-            for key in image_keys
-        }
-    else:
-        # The client already resized the images for transport. Only convert HWC
-        # to CHW here; restoring the original resolution would waste server work.
-        image_dict = {
-            key: extract_images_from_raw_observation(lerobot_obs, key).permute(2, 0, 1)
-            for key in image_keys
-        }
+    image_dict = {
+        image_k: extract_images_from_raw_observation(lerobot_obs, image_k) for image_k in image_keys
+    }
+
+    # Turns the image features to (C, H, W) with H, W matching the policy image features.
+    # This reduces the resolution of the images
+    image_dict = {
+        key: resize_robot_observation_image(torch.tensor(lerobot_obs[key]), policy_image_features[key].shape)
+        for key in image_keys
+    }
 
     if "task" in robot_obs:
         state_dict["task"] = robot_obs["task"]
@@ -291,27 +221,18 @@ class TimedData:
 @dataclass
 class TimedAction(TimedData):
     action: Action
-    source_prefetch_request_id: int | None = None
 
     def get_action(self):
         return self.action
-
-    def get_source_prefetch_request_id(self):
-        return getattr(self, "source_prefetch_request_id", None)
 
 
 @dataclass
 class TimedObservation(TimedData):
     observation: RawObservation
     must_go: bool = False
-    prefetch_requested: bool = False
-    prefetch_request_id: int | None = None
 
     def get_observation(self):
         return self.observation
-
-    def get_prefetch_request_id(self):
-        return getattr(self, "prefetch_request_id", None)
 
 
 @dataclass
@@ -350,7 +271,6 @@ class RemotePolicyConfig:
     actions_per_chunk: int
     device: str = "cpu"
     rename_map: dict[str, str] = field(default_factory=dict)
-    transport_image_scale: float = 1.0
 
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:

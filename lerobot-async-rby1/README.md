@@ -36,3 +36,56 @@ lerobot-robot-replay --robot.type=rby1 --actions-file=actions.jsonl --fps=30
 ```
 
 Running via `python -m lerobot_async_inference.robot_client` works the same way.
+
+## gRPC camera image transport
+
+The robot still captures each camera at the resolution and FPS configured under
+`--robot.cameras`. The following client-only options transform camera images
+after capture and immediately before gRPC serialization. The policy server
+detects the transport metadata automatically and restores every image to its
+original HWC RGB `uint8` shape before policy preprocessing.
+
+Legacy behavior (the defaults):
+
+```bash
+lerobot-robot-client \
+  ... \
+  --image_resize_scale=1.0 \
+  --jpeg_compression=false
+```
+
+Resize only (`640x480 -> 320x240 -> network -> 640x480`):
+
+```bash
+lerobot-robot-client \
+  ... \
+  --image_resize_scale=0.5 \
+  --jpeg_compression=false
+```
+
+JPEG only (`640x480 -> JPEG -> network -> decode -> 640x480`):
+
+```bash
+lerobot-robot-client \
+  ... \
+  --image_resize_scale=1.0 \
+  --jpeg_compression=true
+```
+
+Resize and JPEG
+(`640x480 -> 320x240 -> JPEG -> network -> decode -> 640x480`):
+
+```bash
+lerobot-robot-client \
+  ... \
+  --image_resize_scale=0.5 \
+  --jpeg_compression=true
+```
+
+`image_resize_scale` must satisfy `0 < scale <= 1.0`. JPEG quality is fixed at
+85 and is intentionally not exposed as another CLI option. No matching policy
+server option is needed:
+
+```bash
+lerobot-policy-server --host=0.0.0.0 --port=8080 --fps=15
+```

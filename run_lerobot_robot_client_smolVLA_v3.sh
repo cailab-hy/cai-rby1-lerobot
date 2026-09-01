@@ -14,31 +14,37 @@ lerobot-robot-client \
   --robot.use_gripper=true \
   --robot.action_mode=joint \
   --robot.cameras='{
-    "front": {
+    "camera1": {
       "type": "intelrealsense",
       "serial_number_or_name": "260322274450",
       "fps": 15,
-      "width": 640,
-      "height": 480
+      "width": 424,
+      "height": 240
     },
-    "left": {
+    "camera2": {
       "type": "intelrealsense",
       "serial_number_or_name": "260322274992",
       "fps": 15,
-      "width": 640,
-      "height": 480
+      "width": 424,
+      "height": 240
     },
+    "camera3": {
+      "type": "intelrealsense",
+      "serial_number_or_name": "260322276006",
+      "fps": 15,
+      "width": 424,
+      "height": 240
+    }
   }' \
-  --policy_type=pi0 \
-  --pretrained_name_or_path=/home/cai/rby1-lerobot/rby1-lerobot/outputs/pi0_training_v0.1/checkpoints/030000/pretrained_model \
+  --policy_type=smolvla \
+  --pretrained_name_or_path=/home/cai/rby1-lerobot/cai-rby1-lerobot/outputs/smolVLA_bs32_ViT_VLM_expert/checkpoints/020000/pretrained_model \
   --policy_device=cuda \
   --client_device=cpu \
-  --image_resize_scale=0.5 \
   --actions_per_chunk=50 \
-  --chunk_size_threshold=0.25 \
+  --chunk_size_threshold=0.5 \
   --aggregate_fn_name=weighted_average \
-  --arm_temporal_crossfade=true \
-  --debug_chunk_transitions=false \
-  --debug_weighted_aggregation=false \
-  --task="Put the dish into the dish box with the left arm." \
+  --task="Pick up the bowl and place it in the box." \
   --fps=15
+
+# Pick up the bowl and place it in the box.
+# Pick up the cup and place it in the box.

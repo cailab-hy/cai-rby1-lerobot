@@ -60,17 +60,15 @@ python -m lerobot.async_inference.robot_client \
 
 """
 
-import json
 import logging
 import pickle  # nosec
 import threading
-import time
-from collections import deque
-from collections.abc import Callable
-from dataclasses import asdict
+import time, json
 from datetime import datetime
+from collections.abc import Callable
+from dataclasses import asdict, replace
 from pprint import pformat
-from queue import Empty, Full, Queue
+from queue import Empty, Queue
 from typing import Any
 
 import draccus
@@ -124,19 +122,15 @@ from .helpers import (
     TimedObservation,
     get_logger,
     map_robot_keys_to_lerobot_features,
-    resize_image_by_scale,
-    scale_lerobot_image_features,
     visualize_action_queue_size,
 )
+from .image_transport import JPEG_QUALITY, encode_observation_images
 
 LOG_RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 RAW_ACTION_LOG = f"raw_actions_{LOG_RUN_ID}.jsonl"
 FINAL_ACTION_LOG = f"final_actions_{LOG_RUN_ID}.jsonl"
 OBSERVATION_LOG = f"observations_{LOG_RUN_ID}.jsonl"
-PREFETCH_EVENT_LOG = f"prefetch_events_{LOG_RUN_ID}.jsonl"
-CHUNK_TRANSITION_LOG = f"chunk_transitions_{LOG_RUN_ID}.jsonl"
-WEIGHTED_AGGREGATION_LOG = f"weighted_aggregation_{LOG_RUN_ID}.jsonl"
 
 REMOTE_ZMQ_BACKENDS = {
     "groot_zmq": {
@@ -174,6 +168,7 @@ class RobotClient:
         self.config = config
         self.robot = make_robot_from_config(config.robot)
         self.robot.connect()
+        self.camera_keys = tuple(self.robot.cameras.keys())
         self.backend = getattr(config, "backend", "grpc")
 
         self.policy_config = None
@@ -186,29 +181,25 @@ class RobotClient:
 
         if self.uses_grpc_backend:
             lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
-            self.transport_image_keys = [
-                key.removeprefix("observation.images.")
-                for key, feature in lerobot_features.items()
-                if feature.get("dtype") in {"image", "video"}
-            ]
-            lerobot_features = scale_lerobot_image_features(
-                lerobot_features,
-                config.image_resize_scale,
-            )
 
             self.policy_config = RemotePolicyConfig(
-                policy_type=config.policy_type,
-                pretrained_name_or_path=config.pretrained_name_or_path,
-                lerobot_features=lerobot_features,
-                actions_per_chunk=config.actions_per_chunk,
-                device=config.policy_device,
-                transport_image_scale=config.image_resize_scale,
+                config.policy_type,
+                config.pretrained_name_or_path,
+                lerobot_features,
+                config.actions_per_chunk,
+                config.policy_device,
             )
             self.channel = grpc.insecure_channel(
                 self.server_address, grpc_channel_options(initial_backoff=f"{config.environment_dt:.4f}s")
             )
             self.stub = services_pb2_grpc.AsyncInferenceStub(self.channel)
             self.logger.info(f"Initializing client to connect to server at {self.server_address}")
+            self.logger.info(
+                "Image transport: resize scale = %.3f, JPEG compression = %s, JPEG quality = %d",
+                self.config.image_resize_scale,
+                self.config.jpeg_compression,
+                JPEG_QUALITY,
+            )
 
         elif self.uses_remote_zmq_backend:
             backend_spec = get_remote_backend_spec(self.backend)
@@ -251,56 +242,6 @@ class RobotClient:
         # Use an event for thread-safe coordination
         self.must_go = threading.Event()
         self.must_go.set()  # Initially set - observations qualify for direct processing
-
-        # gRPC-only one-shot prefetch scheduling state. None of this enters policy observations.
-        self.prefetch_state_lock = threading.Lock()
-        self.prefetch_log_lock = threading.Lock()
-        self.prefetch_request_pending = False
-        self.pending_prefetch_request_id = None
-        self.pending_prefetch_observation_timestep = None
-        self.prefetch_request_sent_monotonic_time = None
-        self._prefetch_request_sequence = 0
-        self._prefetch_trigger_request_id = None
-        self._previous_action_queue_ratio = None
-        self._prefetch_pending_skip_logged = False
-
-        # Optional chunk diagnostics are produced in the receiver thread and written by a
-        # dedicated writer so file I/O never blocks the control loop.
-        self._chunk_transition_id = 0
-        self._chunk_transition_log_queue = None
-        self._chunk_transition_writer_thread = None
-        self._recent_action_periods = deque(maxlen=max(1, self.config.fps))
-        self._previous_action_monotonic_time = None
-        self.previous_executed_timestep = None
-        if self.config.debug_chunk_transitions:
-            self._chunk_transition_log_queue = Queue()
-            self._chunk_transition_writer_thread = threading.Thread(
-                target=self._chunk_transition_writer,
-                name="chunk-transition-writer",
-                daemon=True,
-            )
-            self._chunk_transition_writer_thread.start()
-
-        self._weighted_aggregation_log_queue = None
-        self._weighted_aggregation_writer_thread = None
-        self._weighted_aggregation_dropped_transitions = 0
-        self.latest_executed_action = None
-        if self.config.debug_weighted_aggregation:
-            self._weighted_aggregation_log_queue = Queue(
-                maxsize=self.config.weighted_aggregation_logger_queue_maxsize
-            )
-            self._weighted_aggregation_writer_thread = threading.Thread(
-                target=self._weighted_aggregation_writer,
-                name="weighted-aggregation-writer",
-                daemon=True,
-            )
-            self._weighted_aggregation_writer_thread.start()
-
-        # The gRPC sender publishes compact image transport timing/shape metadata here;
-        # the next final-action record consumes it without retaining any image pixels.
-        self.observation_debug_lock = threading.Lock()
-        self._pending_observation_transport_debug = None
-        self._last_send_observation_diagnostics = None
 
     @property
     def running(self):
@@ -386,19 +327,6 @@ class RobotClient:
         """Stop the robot client"""
         self.shutdown_event.set()
 
-        if self._chunk_transition_log_queue is not None:
-            self._chunk_transition_log_queue.put(None)
-        if self._chunk_transition_writer_thread is not None:
-            self._chunk_transition_writer_thread.join(timeout=2.0)
-        if self._weighted_aggregation_log_queue is not None:
-            try:
-                self._weighted_aggregation_log_queue.put_nowait(None)
-            except Full:
-                # The daemon writer will finish whatever was already queued; shutdown must not block.
-                pass
-        if self._weighted_aggregation_writer_thread is not None:
-            self._weighted_aggregation_writer_thread.join(timeout=2.0)
-
         self.robot.disconnect()
         self.logger.debug("Robot disconnected")
 
@@ -410,1055 +338,6 @@ class RobotClient:
             self.remote_client.close()
             self.remote_client = None
             self.logger.debug("Remote ZMQ client closed")
-
-    def _prefetch_state_snapshot(self) -> dict[str, Any]:
-        with self.prefetch_state_lock:
-            return {
-                "prefetch_request_pending": self.prefetch_request_pending,
-                "pending_prefetch_request_id": self.pending_prefetch_request_id,
-                "pending_prefetch_observation_timestep": (
-                    self.pending_prefetch_observation_timestep
-                ),
-                "prefetch_request_sent_monotonic_time": (
-                    self.prefetch_request_sent_monotonic_time
-                ),
-            }
-
-    def _log_prefetch_event(
-        self,
-        event: str,
-        *,
-        timestep: int | None,
-        queue_size: int,
-        queue_ratio: float,
-        request_id: int | None,
-        **fields: Any,
-    ) -> None:
-        record = {
-            "event": event,
-            "wall_time": time.time(),
-            "monotonic_time": time.perf_counter(),
-            "timestep": timestep,
-            "queue_size": queue_size,
-            "queue_ratio": queue_ratio,
-            "request_id": request_id,
-            "prefetch_request_id": request_id,
-            **self._prefetch_state_snapshot(),
-            **fields,
-        }
-        try:
-            with self.prefetch_log_lock:
-                with open(PREFETCH_EVENT_LOG, "a", encoding="utf-8") as stream:
-                    stream.write(json.dumps(record) + "\n")
-        except Exception as error:
-            # Debug logging must never block scheduling recovery or acknowledgement handling.
-            self.logger.warning("Failed to write prefetch event %s: %s", event, error)
-
-    def _action_queue_ratio(self) -> tuple[int, float]:
-        with self.action_queue_lock:
-            queue_size = self.action_queue.qsize()
-        if self.action_chunk_size <= 0:
-            return queue_size, 0.0
-        return queue_size, queue_size / self.action_chunk_size
-
-    def _chunk_transition_writer(self) -> None:
-        """Drain chunk transition records without blocking inference or robot control."""
-        assert self._chunk_transition_log_queue is not None
-        try:
-            with open(CHUNK_TRANSITION_LOG, "a", encoding="utf-8") as stream:
-                while True:
-                    record = self._chunk_transition_log_queue.get()
-                    if record is None:
-                        break
-                    stream.write(json.dumps(record) + "\n")
-                    stream.flush()
-        except Exception as error:
-            self.logger.warning("Chunk transition writer stopped after an error: %s", error)
-
-    def _next_chunk_transition_id(self) -> int:
-        self._chunk_transition_id += 1
-        return self._chunk_transition_id
-
-    def _weighted_aggregation_writer(self) -> None:
-        """Write complete transition batches without blocking the action receiver."""
-        assert self._weighted_aggregation_log_queue is not None
-        try:
-            with open(WEIGHTED_AGGREGATION_LOG, "a", encoding="utf-8") as stream:
-                while True:
-                    records = self._weighted_aggregation_log_queue.get()
-                    if records is None:
-                        break
-                    for record in records:
-                        stream.write(json.dumps(record) + "\n")
-                    stream.flush()
-        except Exception as error:
-            self.logger.warning("Weighted aggregation writer stopped after an error: %s", error)
-
-    @staticmethod
-    def _is_arm_joint_action_feature(name: str) -> bool:
-        """Match RBY1 joint-mode arm features without including grippers or EE poses."""
-        prefix, separator, joint_index = name.rpartition("_")
-        return (
-            separator == "_"
-            and prefix in {"left_arm", "right_arm"}
-            and joint_index.isdigit()
-        )
-
-    @classmethod
-    def _arm_action_metadata(
-        cls, action_feature_names: list[str]
-    ) -> tuple[list[int], list[str]]:
-        arm_indices = [
-            index
-            for index, name in enumerate(action_feature_names)
-            if cls._is_arm_joint_action_feature(name)
-        ]
-        return arm_indices, [action_feature_names[index] for index in arm_indices]
-
-    @staticmethod
-    def _action_delta_fields(
-        prefix: str,
-        delta: torch.Tensor,
-        action_feature_names: list[str],
-    ) -> dict[str, Any]:
-        """Convert one action delta to compact JSON diagnostics."""
-        summary_prefix = {
-            "old_vs_incoming": "old_incoming",
-            "old_vs_merged": "old_merged",
-            "incoming_vs_merged": "incoming_merged",
-        }.get(prefix, prefix)
-        delta_cpu = delta.detach().cpu()
-        delta_values = delta_cpu.tolist()
-        if not delta_values:
-            return {
-                f"action_delta_{prefix}": [],
-                f"{summary_prefix}_max_abs_delta": None,
-                f"{summary_prefix}_max_abs_delta_index": None,
-                f"{summary_prefix}_max_abs_delta_name": None,
-                f"{summary_prefix}_max_abs_delta_rad": None,
-                f"{summary_prefix}_max_abs_delta_deg": None,
-            }
-
-        max_index = int(torch.argmax(torch.abs(delta_cpu)).item())
-        max_delta = float(torch.abs(delta_cpu[max_index]).item())
-        max_name = (
-            action_feature_names[max_index]
-            if max_index < len(action_feature_names)
-            else None
-        )
-        is_arm_joint = bool(
-            max_name
-            and (max_name.startswith("left_arm_") or max_name.startswith("right_arm_"))
-        )
-        return {
-            f"action_delta_{prefix}": delta_values,
-            f"{summary_prefix}_max_abs_delta": max_delta,
-            f"{summary_prefix}_max_abs_delta_index": max_index,
-            f"{summary_prefix}_max_abs_delta_name": max_name,
-            f"{summary_prefix}_max_abs_delta_rad": max_delta if is_arm_joint else None,
-            f"{summary_prefix}_max_abs_delta_deg": (
-                max_delta * 180.0 / 3.141592653589793 if is_arm_joint else None
-            ),
-        }
-
-    @staticmethod
-    def _arm_delta_fields(
-        prefix: str,
-        delta: torch.Tensor,
-        arm_indices: list[int],
-        action_feature_names: list[str],
-    ) -> dict[str, Any]:
-        if not arm_indices:
-            return {
-                f"{prefix}_max_abs_delta": None,
-                f"{prefix}_max_abs_delta_index": None,
-                f"{prefix}_max_abs_delta_name": None,
-                f"{prefix}_max_abs_delta_rad": None,
-                f"{prefix}_max_abs_delta_deg": None,
-            }
-
-        delta_cpu = delta.detach().cpu()
-        local_max_index = int(torch.argmax(torch.abs(delta_cpu[arm_indices])).item())
-        max_index = arm_indices[local_max_index]
-        max_delta = float(torch.abs(delta_cpu[max_index]).item())
-        return {
-            f"{prefix}_max_abs_delta": max_delta,
-            f"{prefix}_max_abs_delta_index": max_index,
-            f"{prefix}_max_abs_delta_name": action_feature_names[max_index],
-            f"{prefix}_max_abs_delta_rad": max_delta,
-            f"{prefix}_max_abs_delta_deg": max_delta * 180.0 / 3.141592653589793,
-        }
-
-    def _direction_reversal_fields(
-        self,
-        *,
-        timestep: int,
-        old_actions: dict[int, torch.Tensor],
-        merged_actions: dict[int, torch.Tensor],
-        action_feature_names: list[str],
-    ) -> dict[str, Any]:
-        previous_timestep = timestep - 1
-        if previous_timestep not in old_actions or previous_timestep not in merged_actions:
-            return {
-                "old_velocity_proxy": None,
-                "merged_velocity_proxy": None,
-                "direction_reversal_indices": [],
-                "direction_reversal_names": [],
-                "direction_reversal_count": 0,
-            }
-
-        old_velocity = old_actions[timestep] - old_actions[previous_timestep]
-        merged_velocity = merged_actions[timestep] - merged_actions[previous_timestep]
-        old_velocity_cpu = old_velocity.detach().cpu()
-        merged_velocity_cpu = merged_velocity.detach().cpu()
-        epsilon = self.config.direction_reversal_epsilon
-        reversal_indices = []
-        for index, name in enumerate(action_feature_names):
-            if not (name.startswith("left_arm_") or name.startswith("right_arm_")):
-                continue
-            old_delta = float(old_velocity_cpu[index].item())
-            merged_delta = float(merged_velocity_cpu[index].item())
-            if abs(old_delta) > epsilon and abs(merged_delta) > epsilon and old_delta * merged_delta < 0:
-                reversal_indices.append(index)
-
-        return {
-            "old_velocity_proxy": old_velocity_cpu.tolist(),
-            "merged_velocity_proxy": merged_velocity_cpu.tolist(),
-            "direction_reversal_indices": reversal_indices,
-            "direction_reversal_names": [action_feature_names[index] for index in reversal_indices],
-            "direction_reversal_count": len(reversal_indices),
-        }
-
-    def _weighted_aggregation_detail_record(
-        self,
-        *,
-        transition_id: int,
-        timestep: int,
-        region: str,
-        old_action: torch.Tensor,
-        incoming_action: torch.Tensor,
-        merged_action: torch.Tensor,
-        old_weight: float | None,
-        incoming_weight: float | None,
-        blend_index: int | None,
-        blend_count: int,
-        arm_crossfade_enabled: bool,
-        arm_old_weight: float | None,
-        arm_incoming_weight: float | None,
-        arm_indices: list[int],
-        arm_feature_names: list[str],
-        first_blended_timestep: int | None,
-        is_first_new_only_timestep: bool,
-        old_actions: dict[int, torch.Tensor],
-        merged_actions: dict[int, torch.Tensor],
-        action_feature_names: list[str],
-    ) -> dict[str, Any]:
-        record = {
-            "record_type": "timestep_detail",
-            "transition_id": transition_id,
-            "timestep": timestep,
-            "aggregation_region": region,
-            "aggregation_applied": region == "blended",
-            "preservation_reason": "guard_steps" if region == "guard_preserved" else None,
-            "is_first_blended_timestep": timestep == first_blended_timestep,
-            "is_first_new_only_timestep": is_first_new_only_timestep,
-            "blend_index": blend_index,
-            "blend_count": blend_count,
-            "arm_crossfade_enabled": arm_crossfade_enabled,
-            "arm_crossfade_schedule": "linear" if arm_crossfade_enabled else None,
-            "arm_old_weight": arm_old_weight,
-            "arm_incoming_weight": arm_incoming_weight,
-            "non_arm_old_weight": old_weight,
-            "non_arm_incoming_weight": incoming_weight,
-            "arm_indices": arm_indices,
-            "arm_feature_names": arm_feature_names,
-            "old_action": old_action.detach().cpu().tolist(),
-            "incoming_action": incoming_action.detach().cpu().tolist(),
-            # This is the exact tensor inserted into future_action_queue.
-            "merged_action": merged_action.detach().cpu().tolist(),
-            "old_weight": old_weight,
-            "incoming_weight": incoming_weight,
-            "raw_old_weight": old_weight,
-            "raw_incoming_weight": incoming_weight,
-            "weight_normalization_applied": False,
-            "normalized_old_weight": None,
-            "normalized_incoming_weight": None,
-            "contributing_sources": (
-                ["old_queue", "incoming_chunk"]
-                if region == "blended"
-                else ["old_queue"]
-            ),
-            "contributing_weights": (
-                [old_weight, incoming_weight] if region == "blended" else None
-            ),
-            "contributing_weights_by_group": (
-                {
-                    "arm": {
-                        "old_weight": arm_old_weight,
-                        "incoming_weight": arm_incoming_weight,
-                    },
-                    "non_arm": {
-                        "old_weight": old_weight,
-                        "incoming_weight": incoming_weight,
-                    },
-                }
-                if region == "blended"
-                else None
-            ),
-        }
-        record.update(
-            self._action_delta_fields(
-                "old_vs_incoming", incoming_action - old_action, action_feature_names
-            )
-        )
-        record.update(
-            self._action_delta_fields(
-                "old_vs_merged", merged_action - old_action, action_feature_names
-            )
-        )
-        record.update(
-            self._action_delta_fields(
-                "incoming_vs_merged", merged_action - incoming_action, action_feature_names
-            )
-        )
-        record.update(
-            self._arm_delta_fields(
-                "arm_old_incoming",
-                incoming_action - old_action,
-                arm_indices,
-                action_feature_names,
-            )
-        )
-        record.update(
-            self._arm_delta_fields(
-                "arm_old_merged",
-                merged_action - old_action,
-                arm_indices,
-                action_feature_names,
-            )
-        )
-        record.update(
-            self._direction_reversal_fields(
-                timestep=timestep,
-                old_actions=old_actions,
-                merged_actions=merged_actions,
-                action_feature_names=action_feature_names,
-            )
-        )
-        return record
-
-    def _log_weighted_aggregation_transition(
-        self,
-        *,
-        transition_id: int,
-        latest_action: int,
-        incoming_source_timestep: int | None,
-        source_prefetch_request_id: int | None,
-        old_actions: dict[int, torch.Tensor],
-        incoming_actions: dict[int, torch.Tensor],
-        merged_actions: dict[int, torch.Tensor],
-        blended_results: dict[int, dict[str, Any]],
-        aggregation_weights: tuple[float, float] | None,
-        previous_executed_action: list[float] | None,
-    ) -> None:
-        if not self.config.debug_weighted_aggregation:
-            return
-
-        action_feature_names = list(self.robot.action_features)
-        arm_indices, arm_feature_names = self._arm_action_metadata(action_feature_names)
-        old_timesteps = sorted(old_actions)
-        incoming_timesteps = sorted(incoming_actions)
-        merged_timesteps = sorted(merged_actions)
-        overlap_timesteps = sorted(set(old_timesteps) & set(incoming_timesteps))
-        guard_until = latest_action + 5
-        guard_preserved_timesteps = [
-            timestep
-            for timestep in old_timesteps
-            if latest_action < timestep <= guard_until and timestep in merged_actions
-        ]
-        guard_preserved_overlap_timesteps = sorted(
-            set(guard_preserved_timesteps) & set(incoming_timesteps)
-        )
-        blended_timesteps = sorted(blended_results)
-        first_blended_timestep = blended_timesteps[0] if blended_timesteps else None
-        last_blended_timestep = blended_timesteps[-1] if blended_timesteps else None
-        new_only_timesteps = sorted(
-            (set(incoming_timesteps) - set(old_timesteps)) & set(merged_timesteps)
-        )
-        first_new_only_timestep = next(
-            (
-                timestep
-                for timestep in new_only_timesteps
-                if last_blended_timestep is not None and timestep > last_blended_timestep
-            ),
-            None,
-        )
-        old_weight, incoming_weight = aggregation_weights or (None, None)
-
-        header = {
-            "record_type": "transition_header",
-            "transition_id": transition_id,
-            "wall_time": time.time(),
-            "monotonic_time": time.perf_counter(),
-            "latest_action": latest_action,
-            "incoming_source_timestep": incoming_source_timestep,
-            "prefetch_request_id": source_prefetch_request_id,
-            "aggregate_fn_name": self.config.aggregate_fn_name,
-            "actual_aggregation_weights": (
-                {"old_weight": old_weight, "incoming_weight": incoming_weight}
-                if aggregation_weights is not None
-                else None
-            ),
-            "non_arm_aggregation_weights": (
-                {"old_weight": old_weight, "incoming_weight": incoming_weight}
-                if aggregation_weights is not None
-                else None
-            ),
-            "weight_schedule": (
-                "constant_per_blended_timestep" if aggregation_weights is not None else None
-            ),
-            "arm_temporal_crossfade": self.config.arm_temporal_crossfade,
-            "arm_crossfade_schedule": (
-                "linear" if self.config.arm_temporal_crossfade else None
-            ),
-            "arm_indices": arm_indices,
-            "arm_feature_names": arm_feature_names,
-            "non_arm_feature_names": [
-                name for index, name in enumerate(action_feature_names) if index not in arm_indices
-            ],
-            "guard_steps": 5,
-            "old_queue_size": len(old_timesteps),
-            "incoming_chunk_size": len(incoming_timesteps),
-            "new_queue_size": len(merged_timesteps),
-            "old_queue_first_timestep": old_timesteps[0] if old_timesteps else None,
-            "old_queue_last_timestep": old_timesteps[-1] if old_timesteps else None,
-            "incoming_first_timestep": incoming_timesteps[0] if incoming_timesteps else None,
-            "incoming_last_timestep": incoming_timesteps[-1] if incoming_timesteps else None,
-            "overlap_first_timestep": overlap_timesteps[0] if overlap_timesteps else None,
-            "overlap_last_timestep": overlap_timesteps[-1] if overlap_timesteps else None,
-            "overlap_count": len(overlap_timesteps),
-            "guard_preserved_timesteps": guard_preserved_timesteps,
-            "guard_preserved_overlap_timesteps": guard_preserved_overlap_timesteps,
-            "blended_timesteps": blended_timesteps,
-            "first_blended_timestep": first_blended_timestep,
-            "last_blended_timestep": last_blended_timestep,
-            "first_new_only_timestep": first_new_only_timestep,
-            "action_feature_names": action_feature_names,
-            "direction_reversal_epsilon": self.config.direction_reversal_epsilon,
-        }
-
-        detail_records = []
-        for timestep in guard_preserved_overlap_timesteps:
-            detail_records.append(
-                self._weighted_aggregation_detail_record(
-                    transition_id=transition_id,
-                    timestep=timestep,
-                    region="guard_preserved",
-                    old_action=old_actions[timestep],
-                    incoming_action=incoming_actions[timestep],
-                    merged_action=merged_actions[timestep],
-                    old_weight=None,
-                    incoming_weight=None,
-                    blend_index=None,
-                    blend_count=len(blended_timesteps),
-                    arm_crossfade_enabled=False,
-                    arm_old_weight=None,
-                    arm_incoming_weight=None,
-                    arm_indices=arm_indices,
-                    arm_feature_names=arm_feature_names,
-                    first_blended_timestep=first_blended_timestep,
-                    is_first_new_only_timestep=False,
-                    old_actions=old_actions,
-                    merged_actions=merged_actions,
-                    action_feature_names=action_feature_names,
-                )
-            )
-        for timestep in blended_timesteps:
-            blend_result = blended_results[timestep]
-            detail_records.append(
-                self._weighted_aggregation_detail_record(
-                    transition_id=transition_id,
-                    timestep=timestep,
-                    region="blended",
-                    old_action=blend_result["old_action"],
-                    incoming_action=blend_result["incoming_action"],
-                    merged_action=blend_result["merged_action"],
-                    old_weight=old_weight,
-                    incoming_weight=incoming_weight,
-                    blend_index=blend_result["blend_index"],
-                    blend_count=blend_result["blend_count"],
-                    arm_crossfade_enabled=blend_result["arm_crossfade_enabled"],
-                    arm_old_weight=blend_result["arm_old_weight"],
-                    arm_incoming_weight=blend_result["arm_incoming_weight"],
-                    arm_indices=arm_indices,
-                    arm_feature_names=arm_feature_names,
-                    first_blended_timestep=first_blended_timestep,
-                    is_first_new_only_timestep=False,
-                    old_actions=old_actions,
-                    merged_actions=merged_actions,
-                    action_feature_names=action_feature_names,
-                )
-            )
-
-        if first_new_only_timestep is not None:
-            first_new_only_action = merged_actions[first_new_only_timestep]
-            detail_records.append(
-                {
-                    "record_type": "timestep_detail",
-                    "transition_id": transition_id,
-                    "timestep": first_new_only_timestep,
-                    "aggregation_region": "new_only",
-                    "aggregation_applied": False,
-                    "preservation_reason": "incoming_only",
-                    "is_first_blended_timestep": False,
-                    "is_first_new_only_timestep": True,
-                    "blend_index": None,
-                    "blend_count": len(blended_timesteps),
-                    "arm_crossfade_enabled": False,
-                    "arm_crossfade_schedule": None,
-                    "arm_old_weight": 0.0,
-                    "arm_incoming_weight": 1.0,
-                    "non_arm_old_weight": 0.0,
-                    "non_arm_incoming_weight": 1.0,
-                    "arm_indices": arm_indices,
-                    "arm_feature_names": arm_feature_names,
-                    "old_action": None,
-                    "incoming_action": incoming_actions[first_new_only_timestep]
-                    .detach()
-                    .cpu()
-                    .tolist(),
-                    "merged_action": first_new_only_action.detach().cpu().tolist(),
-                }
-            )
-
-        def maximum_detail(field: str) -> dict[str, Any] | None:
-            candidates = [
-                record for record in detail_records if record.get(field) is not None
-            ]
-            return max(candidates, key=lambda record: record[field]) if candidates else None
-
-        max_old_incoming = maximum_detail("old_incoming_max_abs_delta")
-        max_old_merged = maximum_detail("old_merged_max_abs_delta")
-        first_blend = next(
-            (record for record in detail_records if record["is_first_blended_timestep"]),
-            None,
-        )
-        last_blend = next(
-            (
-                record
-                for record in detail_records
-                if record.get("timestep") == last_blended_timestep
-                and record.get("aggregation_region") == "blended"
-            ),
-            None,
-        )
-
-        blend_to_new_only = {
-            "last_blended_action": last_blend["merged_action"] if last_blend else None,
-            "first_new_only_action": (
-                merged_actions[first_new_only_timestep].detach().cpu().tolist()
-                if first_new_only_timestep is not None
-                else None
-            ),
-            "action_delta_last_blend_to_new_only": None,
-            "last_blend_to_new_only_arm_max_delta": None,
-            "last_blend_to_new_only_arm_max_abs_delta": None,
-            "last_blend_to_new_only_arm_max_delta_index": None,
-            "last_blend_to_new_only_arm_max_delta_name": None,
-            "last_blend_to_new_only_arm_max_delta_rad": None,
-            "last_blend_to_new_only_arm_max_delta_deg": None,
-        }
-        if last_blended_timestep is not None and first_new_only_timestep is not None:
-            boundary_delta = (
-                merged_actions[first_new_only_timestep]
-                - merged_actions[last_blended_timestep]
-            )
-            blend_to_new_only.update(
-                {
-                    "action_delta_last_blend_to_new_only": boundary_delta
-                    .detach()
-                    .cpu()
-                    .tolist(),
-                    **self._arm_delta_fields(
-                        "last_blend_to_new_only_arm",
-                        boundary_delta,
-                        arm_indices,
-                        action_feature_names,
-                    ),
-                }
-            )
-            blend_to_new_only["last_blend_to_new_only_arm_max_delta"] = (
-                blend_to_new_only["last_blend_to_new_only_arm_max_abs_delta"]
-            )
-
-        next_timestep = merged_timesteps[0] if merged_timesteps else None
-        next_merged_action = merged_actions.get(next_timestep)
-        executed_to_merged = {}
-        if previous_executed_action is not None and next_merged_action is not None:
-            previous_tensor = torch.as_tensor(
-                previous_executed_action,
-                dtype=next_merged_action.dtype,
-                device=next_merged_action.device,
-            )
-            executed_to_merged = {
-                "previous_executed_action": previous_executed_action,
-                "next_merged_timestep": next_timestep,
-                "next_merged_action": next_merged_action.detach().cpu().tolist(),
-                **self._action_delta_fields(
-                    "executed_to_merged",
-                    next_merged_action - previous_tensor,
-                    action_feature_names,
-                ),
-            }
-        else:
-            executed_to_merged = {
-                "previous_executed_action": previous_executed_action,
-                "next_merged_timestep": next_timestep,
-                "next_merged_action": (
-                    next_merged_action.detach().cpu().tolist()
-                    if next_merged_action is not None
-                    else None
-                ),
-                "action_delta_executed_to_merged": None,
-                "executed_to_merged_max_abs_delta": None,
-                "executed_to_merged_max_abs_delta_index": None,
-                "executed_to_merged_max_abs_delta_name": None,
-                "executed_to_merged_max_abs_delta_rad": None,
-                "executed_to_merged_max_abs_delta_deg": None,
-            }
-
-        summary = {
-            **header,
-            "record_type": "transition_summary",
-            "guard_preserved_count": len(guard_preserved_timesteps),
-            "blended_count": len(blended_timesteps),
-            "max_old_incoming_delta": (
-                max_old_incoming["old_incoming_max_abs_delta"]
-                if max_old_incoming
-                else None
-            ),
-            "max_old_incoming_delta_timestep": (
-                max_old_incoming["timestep"] if max_old_incoming else None
-            ),
-            "max_old_incoming_delta_joint": (
-                max_old_incoming["old_incoming_max_abs_delta_name"]
-                if max_old_incoming
-                else None
-            ),
-            "max_old_merged_delta": (
-                max_old_merged["old_merged_max_abs_delta"] if max_old_merged else None
-            ),
-            "max_old_merged_delta_timestep": (
-                max_old_merged["timestep"] if max_old_merged else None
-            ),
-            "max_old_merged_delta_joint": (
-                max_old_merged["old_merged_max_abs_delta_name"]
-                if max_old_merged
-                else None
-            ),
-            "first_blend_old_weight": first_blend["old_weight"] if first_blend else None,
-            "first_blend_incoming_weight": (
-                first_blend["incoming_weight"] if first_blend else None
-            ),
-            "first_blend_old_incoming_max_delta": (
-                first_blend["old_incoming_max_abs_delta"] if first_blend else None
-            ),
-            "first_blend_old_merged_max_delta": (
-                first_blend["old_merged_max_abs_delta"] if first_blend else None
-            ),
-            "first_blend_direction_reversal_count": (
-                first_blend["direction_reversal_count"] if first_blend else 0
-            ),
-            "first_blend_arm_old_incoming_max_delta": (
-                first_blend["arm_old_incoming_max_abs_delta"] if first_blend else None
-            ),
-            "first_blend_arm_old_merged_max_delta": (
-                first_blend["arm_old_merged_max_abs_delta"] if first_blend else None
-            ),
-            "last_blend_arm_old_merged_max_delta": (
-                last_blend["arm_old_merged_max_abs_delta"] if last_blend else None
-            ),
-            **blend_to_new_only,
-            **executed_to_merged,
-            "debug_event_drop_count": self._weighted_aggregation_dropped_transitions,
-        }
-
-        try:
-            assert self._weighted_aggregation_log_queue is not None
-            self._weighted_aggregation_log_queue.put_nowait([header, *detail_records, summary])
-        except Full:
-            self._weighted_aggregation_dropped_transitions += 1
-
-    @staticmethod
-    def _internal_gap_details(timesteps: list[int]) -> tuple[list[int], list[dict[str, Any]]]:
-        missing_timesteps = []
-        gap_ranges = []
-        for previous_timestep, next_timestep in zip(timesteps, timesteps[1:]):
-            if next_timestep <= previous_timestep + 1:
-                continue
-            missing = list(range(previous_timestep + 1, next_timestep))
-            missing_timesteps.extend(missing)
-            gap_ranges.append(
-                {
-                    "previous_timestep": previous_timestep,
-                    "next_timestep": next_timestep,
-                    "gap_size": len(missing),
-                    "missing_timesteps": missing,
-                }
-            )
-        return missing_timesteps, gap_ranges
-
-    @classmethod
-    def _build_chunk_transition_record(
-        cls,
-        *,
-        latest_action: int,
-        old_timesteps: list[int],
-        incoming_timesteps: list[int],
-        updated_timesteps: list[int],
-        guard_steps: int = 5,
-    ) -> dict[str, Any]:
-        """Build timestep-only diagnostics without changing queue contents or actions."""
-        old_timesteps = list(old_timesteps)
-        incoming_timesteps = list(incoming_timesteps)
-        updated_timesteps = list(updated_timesteps)
-        old_set = set(old_timesteps)
-        incoming_set = set(incoming_timesteps)
-        updated_set = set(updated_timesteps)
-
-        overlap_timesteps = sorted(old_set & incoming_set)
-        old_only_future_timesteps = sorted(
-            timestep
-            for timestep in old_set - incoming_set
-            if timestep > latest_action
-        )
-        incoming_only_timesteps = sorted(incoming_set - old_set)
-        stale_incoming_timesteps = sorted(
-            timestep for timestep in incoming_set if timestep <= latest_action
-        )
-
-        guard_until = latest_action + guard_steps
-        incoming_guard_filtered_timesteps = sorted(
-            timestep
-            for timestep in incoming_set
-            if latest_action < timestep <= guard_until
-        )
-        old_guard_preserved_timesteps = sorted(
-            timestep
-            for timestep in old_set & updated_set
-            if latest_action < timestep <= guard_until
-        )
-        old_guard_timesteps = sorted(
-            timestep
-            for timestep in old_set
-            if latest_action < timestep <= guard_until
-        )
-        old_future_dropped_timesteps = sorted(
-            timestep
-            for timestep in old_set - updated_set
-            if timestep > latest_action
-        )
-        incoming_dropped_timesteps = sorted(incoming_set - updated_set)
-
-        expected_next = latest_action + 1
-        actual_next = updated_timesteps[0] if updated_timesteps else None
-        gap_detected = actual_next != expected_next
-        missing_timesteps = (
-            list(range(expected_next, actual_next))
-            if actual_next is not None and actual_next > expected_next
-            else []
-        )
-
-        if not gap_detected:
-            gap_origin = None
-        elif not old_timesteps:
-            gap_origin = "queue_exhausted_before_chunk_arrival"
-        elif expected_next in old_set and expected_next not in updated_set:
-            gap_origin = "merge_removed_expected_old_action"
-        elif expected_next not in old_set:
-            gap_origin = "gap_already_present_before_merge"
-        else:
-            gap_origin = "unknown"
-
-        internal_missing_timesteps, internal_gap_ranges = cls._internal_gap_details(
-            updated_timesteps
-        )
-        internal_missing_set = set(internal_missing_timesteps)
-        internal_missing_present_in_old_queue = sorted(internal_missing_set & old_set)
-        internal_missing_absent_from_old_queue = sorted(internal_missing_set - old_set)
-        internal_missing_guard_filtered_timesteps = sorted(
-            internal_missing_set & set(incoming_guard_filtered_timesteps)
-        )
-        internal_missing_old_guard_preserved_timesteps = sorted(
-            internal_missing_set & set(old_guard_preserved_timesteps)
-        )
-        internal_missing_merge_dropped_old_timesteps = sorted(
-            internal_missing_set & set(old_future_dropped_timesteps)
-        )
-        internal_missing_guard_filtered_without_old_backup = sorted(
-            internal_missing_set
-            & set(incoming_guard_filtered_timesteps)
-            - old_set
-        )
-        internal_missing_absent_from_both_queues = sorted(
-            internal_missing_set - old_set - incoming_set
-        )
-        classified_internal_missing = (
-            set(internal_missing_guard_filtered_without_old_backup)
-            | set(internal_missing_merge_dropped_old_timesteps)
-            | set(internal_missing_absent_from_both_queues)
-        )
-        internal_missing_unclassified_timesteps = sorted(
-            internal_missing_set - classified_internal_missing
-        )
-
-        internal_gap_origin_components = []
-        if internal_missing_guard_filtered_without_old_backup:
-            internal_gap_origin_components.append("guard_filtered_without_old_backup")
-        if internal_missing_merge_dropped_old_timesteps:
-            internal_gap_origin_components.append("merge_removed_old_future_action")
-        if internal_missing_absent_from_both_queues:
-            internal_gap_origin_components.append("gap_already_present_before_merge")
-        if internal_missing_unclassified_timesteps:
-            internal_gap_origin_components.append("unknown")
-
-        if not internal_gap_ranges:
-            internal_gap_origin = None
-        elif len(internal_gap_origin_components) == 1:
-            internal_gap_origin = internal_gap_origin_components[0]
-        elif len(internal_gap_origin_components) > 1:
-            internal_gap_origin = "mixed"
-        else:
-            internal_gap_origin = "unknown"
-
-        return {
-            "latest_action": latest_action,
-            "guard_steps": guard_steps,
-            "guard_until": guard_until,
-            "old_queue_was_empty": not old_timesteps,
-            "old_queue_size": len(old_timesteps),
-            "old_queue_first": old_timesteps[0] if old_timesteps else None,
-            "old_queue_last": old_timesteps[-1] if old_timesteps else None,
-            "old_queue_timesteps": old_timesteps,
-            "incoming_size": len(incoming_timesteps),
-            "incoming_chunk_size": len(incoming_timesteps),
-            "incoming_first": incoming_timesteps[0] if incoming_timesteps else None,
-            "incoming_last": incoming_timesteps[-1] if incoming_timesteps else None,
-            "incoming_timesteps": incoming_timesteps,
-            "overlap_first": overlap_timesteps[0] if overlap_timesteps else None,
-            "overlap_last": overlap_timesteps[-1] if overlap_timesteps else None,
-            "overlap_count": len(overlap_timesteps),
-            "overlap_timesteps": overlap_timesteps,
-            "old_only_future_timesteps": old_only_future_timesteps,
-            "incoming_only_timesteps": incoming_only_timesteps,
-            "stale_incoming_timesteps": stale_incoming_timesteps,
-            "incoming_guard_filtered_timesteps": incoming_guard_filtered_timesteps,
-            "old_guard_timesteps": old_guard_timesteps,
-            "old_guard_preserved_timesteps": old_guard_preserved_timesteps,
-            "all_available_old_guard_timesteps_preserved": (
-                old_guard_preserved_timesteps == old_guard_timesteps
-            ),
-            "old_future_dropped_timesteps": old_future_dropped_timesteps,
-            "incoming_dropped_timesteps": incoming_dropped_timesteps,
-            "new_queue_size": len(updated_timesteps),
-            "updated_queue_size": len(updated_timesteps),
-            "new_queue_first": actual_next,
-            "new_queue_last": updated_timesteps[-1] if updated_timesteps else None,
-            "new_queue_timesteps": updated_timesteps,
-            "updated_queue_timesteps": updated_timesteps,
-            "expected_next": expected_next,
-            "actual_next": actual_next,
-            "continuity_ok": not gap_detected,
-            "continuity_warning": gap_detected,
-            "warning": "[CHUNK GAP WARNING]" if gap_detected else None,
-            "gap_detected": gap_detected,
-            "gap_size": len(missing_timesteps),
-            "missing_timesteps": missing_timesteps,
-            "gap_origin": gap_origin,
-            "expected_next_present_in_old_queue": expected_next in old_set,
-            "internal_gap_detected": bool(internal_gap_ranges),
-            "internal_gap_count": len(internal_gap_ranges),
-            "internal_missing_timesteps": internal_missing_timesteps,
-            "internal_gap_ranges": internal_gap_ranges,
-            "internal_warning": (
-                "[CHUNK INTERNAL GAP WARNING]" if internal_gap_ranges else None
-            ),
-            "internal_missing_present_in_old_queue": internal_missing_present_in_old_queue,
-            "internal_missing_absent_from_old_queue": internal_missing_absent_from_old_queue,
-            "internal_missing_guard_filtered_timesteps": (
-                internal_missing_guard_filtered_timesteps
-            ),
-            "internal_missing_old_guard_preserved_timesteps": (
-                internal_missing_old_guard_preserved_timesteps
-            ),
-            "internal_missing_merge_dropped_old_timesteps": (
-                internal_missing_merge_dropped_old_timesteps
-            ),
-            "internal_missing_guard_filtered_without_old_backup": (
-                internal_missing_guard_filtered_without_old_backup
-            ),
-            "internal_missing_absent_from_both_queues": (
-                internal_missing_absent_from_both_queues
-            ),
-            "internal_missing_unclassified_timesteps": (
-                internal_missing_unclassified_timesteps
-            ),
-            "internal_gap_origin": internal_gap_origin,
-            "internal_gap_origin_components": internal_gap_origin_components,
-            "any_continuity_gap": gap_detected or bool(internal_gap_ranges),
-        }
-
-    def _log_chunk_transition(
-        self,
-        *,
-        transition_id: int,
-        latest_action: int,
-        old_timesteps: list[int],
-        incoming_timesteps: list[int],
-        updated_timesteps: list[int],
-        source_prefetch_request_id: int | None,
-        queue_update_time_ms: float,
-    ) -> None:
-        if not self.config.debug_chunk_transitions:
-            return
-
-        transition_start = time.perf_counter()
-        record = {
-            "event": "action_chunk_transition",
-            "wall_time": time.time(),
-            "monotonic_time": time.perf_counter(),
-            "transition_id": transition_id,
-            "backend": self.backend,
-            "configured_client_fps": self.config.fps,
-            "recent_actual_action_fps": (
-                1.0 / (sum(self._recent_action_periods) / len(self._recent_action_periods))
-                if self._recent_action_periods
-                else None
-            ),
-            "aggregate_fn_name": self.config.aggregate_fn_name,
-            **self._build_chunk_transition_record(
-                latest_action=latest_action,
-                old_timesteps=old_timesteps,
-                incoming_timesteps=incoming_timesteps,
-                updated_timesteps=updated_timesteps,
-            ),
-            "source_prefetch_request_id": source_prefetch_request_id,
-            "queue_update_time_ms": queue_update_time_ms,
-            **self._prefetch_state_snapshot(),
-        }
-        record["transition_processing_time_ms"] = (
-            time.perf_counter() - transition_start
-        ) * 1000
-        assert self._chunk_transition_log_queue is not None
-        self._chunk_transition_log_queue.put_nowait(record)
-
-    def _consume_prefetch_trigger(self, observation_timestep: int) -> int | None:
-        with self.prefetch_state_lock:
-            request_id = self._prefetch_trigger_request_id
-            if request_id is None or request_id != self.pending_prefetch_request_id:
-                return None
-            self._prefetch_trigger_request_id = None
-            self.pending_prefetch_observation_timestep = observation_timestep
-            return request_id
-
-    def _mark_prefetch_sent(self, request_id: int, observation_timestep: int) -> None:
-        sent_time = time.perf_counter()
-        with self.prefetch_state_lock:
-            if not (
-                self.prefetch_request_pending
-                and self.pending_prefetch_request_id == request_id
-            ):
-                return
-            self.pending_prefetch_observation_timestep = observation_timestep
-            self.prefetch_request_sent_monotonic_time = sent_time
-
-        queue_size, queue_ratio = self._action_queue_ratio()
-        self._log_prefetch_event(
-            "prefetch_sent",
-            timestep=observation_timestep,
-            queue_size=queue_size,
-            queue_ratio=queue_ratio,
-            request_id=request_id,
-        )
-
-    def _rollback_prefetch_request(
-        self,
-        request_id: int,
-        observation_timestep: int,
-        reason: str,
-    ) -> None:
-        with self.prefetch_state_lock:
-            if self.pending_prefetch_request_id != request_id:
-                return
-            self.prefetch_request_pending = False
-            self.pending_prefetch_request_id = None
-            self.pending_prefetch_observation_timestep = None
-            self.prefetch_request_sent_monotonic_time = None
-            self._prefetch_trigger_request_id = None
-            self._previous_action_queue_ratio = self._chunk_size_threshold + 1.0
-            self._prefetch_pending_skip_logged = False
-
-        queue_size, queue_ratio = self._action_queue_ratio()
-        self._log_prefetch_event(
-            "prefetch_pending_cleared",
-            timestep=observation_timestep,
-            queue_size=queue_size,
-            queue_ratio=queue_ratio,
-            request_id=request_id,
-            clear_reason=reason,
-        )
-
-    def _handle_prefetch_acknowledgement(
-        self,
-        source_prefetch_request_id: int | None,
-        source_timestep: int | None,
-    ) -> None:
-        if source_prefetch_request_id is None:
-            return
-
-        queue_size, queue_ratio = self._action_queue_ratio()
-        self._log_prefetch_event(
-            "prefetch_response_received",
-            timestep=source_timestep,
-            queue_size=queue_size,
-            queue_ratio=queue_ratio,
-            request_id=source_prefetch_request_id,
-        )
-
-        with self.prefetch_state_lock:
-            pending_request_id = self.pending_prefetch_request_id
-            if not (
-                self.prefetch_request_pending
-                and pending_request_id == source_prefetch_request_id
-            ):
-                matched = False
-            else:
-                matched = True
-                self.prefetch_request_pending = False
-                self.pending_prefetch_request_id = None
-                self.pending_prefetch_observation_timestep = None
-                self.prefetch_request_sent_monotonic_time = None
-                self._prefetch_trigger_request_id = None
-                self._prefetch_pending_skip_logged = False
-
-        if matched:
-            self._log_prefetch_event(
-                "prefetch_pending_cleared",
-                timestep=source_timestep,
-                queue_size=queue_size,
-                queue_ratio=queue_ratio,
-                request_id=source_prefetch_request_id,
-                clear_reason="matching_response",
-            )
-        else:
-            self._log_prefetch_event(
-                "prefetch_duplicate_response",
-                timestep=source_timestep,
-                queue_size=queue_size,
-                queue_ratio=queue_ratio,
-                request_id=source_prefetch_request_id,
-                pending_request_id=pending_request_id,
-            )
 
     def send_observation(
         self,
@@ -1474,13 +353,38 @@ class RobotClient:
         if not isinstance(obs, TimedObservation):
             raise ValueError("Input observation needs to be a TimedObservation!")
 
+        observation_to_send = obs
+        if self.config.image_resize_scale != 1.0 or self.config.jpeg_compression:
+            transport_observation, image_stats = encode_observation_images(
+                obs.get_observation(),
+                self.camera_keys,
+                self.config.image_resize_scale,
+                self.config.jpeg_compression,
+            )
+            observation_to_send = replace(obs, observation=transport_observation)
+            compression_ratio = (
+                image_stats.original_bytes / image_stats.transport_bytes
+                if image_stats.transport_bytes
+                else 0.0
+            )
+            self.logger.debug(
+                "Image transport preprocessing: images=%d | resize=%.3fms | JPEG encode=%.3fms | "
+                "total=%.3fms | original=%d bytes | transport=%d bytes | compression=%.2fx",
+                image_stats.image_count,
+                image_stats.resize_time * 1000,
+                image_stats.jpeg_encode_time * 1000,
+                image_stats.total_time * 1000,
+                image_stats.original_bytes,
+                image_stats.transport_bytes,
+                compression_ratio,
+            )
+
         start_time = time.perf_counter()
-        observation_bytes = pickle.dumps(obs)
+        observation_bytes = pickle.dumps(observation_to_send)
         serialize_time = time.perf_counter() - start_time
         self.logger.debug(f"Observation serialization time: {serialize_time:.6f}s")
 
         try:
-            grpc_send_start = time.perf_counter()
             observation_iterator = send_bytes_in_chunks(
                 observation_bytes,
                 services_pb2.Observation,
@@ -1488,58 +392,14 @@ class RobotClient:
                 silent=True,
             )
             _ = self.stub.SendObservations(observation_iterator)
-            grpc_send_time = time.perf_counter() - grpc_send_start
-            self._last_send_observation_diagnostics = {
-                "payload_bytes": len(observation_bytes),
-                "pickle_serialize_ms": serialize_time * 1000,
-                "grpc_send_ms": grpc_send_time * 1000,
-                "total_ms": (serialize_time + grpc_send_time) * 1000,
-                "success": True,
-            }
             obs_timestep = obs.get_timestep()
             self.logger.debug(f"Sent observation #{obs_timestep} | ")
 
             return True
 
         except grpc.RpcError as e:
-            self._last_send_observation_diagnostics = {
-                "payload_bytes": len(observation_bytes),
-                "pickle_serialize_ms": serialize_time * 1000,
-                "grpc_send_ms": (time.perf_counter() - grpc_send_start) * 1000,
-                "total_ms": (time.perf_counter() - start_time) * 1000,
-                "success": False,
-            }
             self.logger.error(f"Error sending observation #{obs.get_timestep()}: {e}")
             return False
-
-    def _resize_observation_images_for_transport(
-        self,
-        raw_observation: RawObservation,
-    ) -> tuple[RawObservation, dict[str, float], dict[str, dict[str, Any]]]:
-        """Resize only configured camera frames, preserving aspect ratio and all non-image values."""
-        scale = self.config.image_resize_scale
-        if scale == 1.0:
-            return raw_observation, {}, {}
-
-        transport_observation = dict(raw_observation)
-        resize_timings_ms = {}
-        image_transport = {}
-        for camera_key in self.transport_image_keys:
-            if camera_key not in raw_observation:
-                continue
-            image = raw_observation[camera_key]
-            resize_start = time.perf_counter()
-            resized_image = resize_image_by_scale(image, scale)
-            resize_timings_ms[camera_key] = (time.perf_counter() - resize_start) * 1000
-            transport_observation[camera_key] = resized_image
-            image_transport[camera_key] = {
-                "original_shape": list(image.shape),
-                "transport_shape": list(resized_image.shape),
-                "original_bytes": int(image.nbytes),
-                "transport_bytes": int(resized_image.nbytes),
-            }
-
-        return transport_observation, resize_timings_ms, image_transport
 
     def _inspect_action_queue(self):
         with self.action_queue_lock:
@@ -1552,9 +412,6 @@ class RobotClient:
         self,
         incoming_actions: list[TimedAction],
         aggregate_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
-        *,
-        transition_id: int | None = None,
-        source_prefetch_request_id: int | None = None,
     ):
         """Finds the same timestep actions in the queue and aggregates them using the aggregate_fn"""
         if aggregate_fn is None:
@@ -1569,32 +426,8 @@ class RobotClient:
 
         current_action_queue = {action.get_timestep(): action.get_action() for action in internal_queue}
 
-        debug_weighted_aggregation = self.config.debug_weighted_aggregation
-        arm_temporal_crossfade = self.config.arm_temporal_crossfade
-        arm_indices = (
-            self._arm_action_metadata(list(self.robot.action_features))[0]
-            if arm_temporal_crossfade
-            else []
-        )
-        incoming_action_queue = (
-            {action.get_timestep(): action.get_action() for action in incoming_actions}
-            if debug_weighted_aggregation
-            else None
-        )
-        blended_results = {} if debug_weighted_aggregation else None
-        aggregation_weights = (
-            getattr(aggregate_fn, "aggregation_weights", None)
-            if debug_weighted_aggregation
-            else None
-        )
-
         with self.latest_action_lock:
             latest_action = self.latest_action
-            previous_executed_action = (
-                list(self.latest_executed_action)
-                if debug_weighted_aggregation and self.latest_executed_action is not None
-                else None
-            )
 
 
         ##############################################################
@@ -1602,24 +435,6 @@ class RobotClient:
 
         guard_steps = 5
         guard_until = latest_action + guard_steps
-        track_blend_metadata = arm_temporal_crossfade or debug_weighted_aggregation
-        blended_timesteps = (
-            sorted(
-                {
-                    action.get_timestep()
-                    for action in incoming_actions
-                    if action.get_timestep() > guard_until
-                    and action.get_timestep() in current_action_queue
-                }
-            )
-            if track_blend_metadata
-            else []
-        )
-        blend_count = len(blended_timesteps)
-        blend_index_by_timestep = {
-            timestep: index
-            for index, timestep in enumerate(blended_timesteps, start=1)
-        }
         # old 2개 더 남김
         for old_action in internal_queue:
             if latest_action < old_action.get_timestep() <= guard_until:
@@ -1644,81 +459,18 @@ class RobotClient:
 
             # If the new action's timestep is in the current action queue, aggregate it
             # TODO: There is probably a way to do this with broadcasting of the two action tensors
-            old_action_tensor = current_action_queue[new_action.get_timestep()]
-            incoming_action_tensor = new_action.get_action()
-            merged_action_tensor = aggregate_fn(old_action_tensor, incoming_action_tensor)
-            blend_index = blend_index_by_timestep.get(new_action.get_timestep())
-            arm_crossfade_applied = arm_temporal_crossfade and bool(arm_indices)
-            if arm_crossfade_applied:
-                assert blend_index is not None
-                arm_incoming_weight = blend_index / (blend_count + 1)
-                arm_old_weight = 1.0 - arm_incoming_weight
-                # Preserve the exact existing aggregate result for every non-arm
-                # dimension, then overwrite only identified arm-joint dimensions.
-                merged_action_tensor = merged_action_tensor.clone()
-                merged_action_tensor[arm_indices] = (
-                    arm_old_weight * old_action_tensor[arm_indices]
-                    + arm_incoming_weight * incoming_action_tensor[arm_indices]
-                )
-            else:
-                if aggregation_weights is not None:
-                    arm_old_weight, arm_incoming_weight = aggregation_weights
-                else:
-                    arm_old_weight, arm_incoming_weight = None, None
             future_action_queue.put(
                 TimedAction(
                     timestamp=new_action.get_timestamp(),
                     timestep=new_action.get_timestep(),
-                    action=merged_action_tensor,
-                    source_prefetch_request_id=getattr(
-                        new_action, "source_prefetch_request_id", None
+                    action=aggregate_fn(
+                        current_action_queue[new_action.get_timestep()], new_action.get_action()
                     ),
                 )
             )
-            if blended_results is not None:
-                # Capture references to the exact operands and result used above. No second
-                # aggregation is performed for logging.
-                blended_results[new_action.get_timestep()] = {
-                    "old_action": old_action_tensor,
-                    "incoming_action": incoming_action_tensor,
-                    "merged_action": merged_action_tensor,
-                    "blend_index": blend_index,
-                    "blend_count": blend_count,
-                    "arm_crossfade_enabled": arm_crossfade_applied,
-                    "arm_old_weight": arm_old_weight,
-                    "arm_incoming_weight": arm_incoming_weight,
-                }
 
         with self.action_queue_lock:
             self.action_queue = future_action_queue
-
-        if debug_weighted_aggregation:
-            assert incoming_action_queue is not None
-            assert blended_results is not None
-            if transition_id is None:
-                transition_id = self._next_chunk_transition_id()
-            merged_action_queue = {
-                action.get_timestep(): action.get_action()
-                for action in future_action_queue.queue
-            }
-            try:
-                self._log_weighted_aggregation_transition(
-                    transition_id=transition_id,
-                    latest_action=latest_action,
-                    incoming_source_timestep=(
-                        incoming_actions[0].get_timestep() if incoming_actions else None
-                    ),
-                    source_prefetch_request_id=source_prefetch_request_id,
-                    old_actions=current_action_queue,
-                    incoming_actions=incoming_action_queue,
-                    merged_actions=merged_action_queue,
-                    blended_results=blended_results,
-                    aggregation_weights=aggregation_weights,
-                    previous_executed_action=previous_executed_action,
-                )
-            except Exception as error:
-                # Instrumentation must never affect the already-completed queue update.
-                self.logger.warning("Failed to build weighted aggregation diagnostics: %s", error)
 
     def receive_actions(self, verbose: bool = False):
         """Receive actions from the gRPC policy server"""
@@ -1742,20 +494,6 @@ class RobotClient:
                 deserialize_start = time.perf_counter()
                 timed_actions = pickle.loads(actions_chunk.data)  # nosec
                 deserialize_time = time.perf_counter() - deserialize_start
-                source_prefetch_request_ids = {
-                    getattr(action, "source_prefetch_request_id", None)
-                    for action in timed_actions
-                    if getattr(action, "source_prefetch_request_id", None) is not None
-                }
-                if len(source_prefetch_request_ids) == 1:
-                    source_prefetch_request_id = next(iter(source_prefetch_request_ids))
-                else:
-                    source_prefetch_request_id = None
-                    if len(source_prefetch_request_ids) > 1:
-                        self.logger.error(
-                            "Received one action chunk with inconsistent prefetch request IDs: %s",
-                            sorted(source_prefetch_request_ids),
-                        )
 
                 # Log device type of received actions
                 if len(timed_actions) > 0:
@@ -1774,18 +512,20 @@ class RobotClient:
 
                 self.action_chunk_size = max(self.action_chunk_size, len(timed_actions))
 
-                with self.latest_action_lock:
-                    latest_action = self.latest_action
-                capture_transition = self.config.debug_chunk_transitions or verbose
-                if capture_transition:
-                    old_size, old_timesteps = self._inspect_action_queue()
-                    incoming_timesteps = [action.get_timestep() for action in timed_actions]
-                else:
-                    old_size, old_timesteps, incoming_timesteps = 0, [], []
-
                 # Calculate network latency if we have matching observations
                 if len(timed_actions) > 0 and verbose:
+                    with self.latest_action_lock:
+                        latest_action = self.latest_action
+
                     self.logger.debug(f"Current latest action: {latest_action}")
+
+                    # Get queue state before changes
+                    old_size, old_timesteps = self._inspect_action_queue()
+                    if not old_timesteps:
+                        old_timesteps = [latest_action]  # queue was empty
+
+                    # Log incoming actions
+                    incoming_timesteps = [a.get_timestep() for a in timed_actions]
 
                     first_action_timestep = timed_actions[0].get_timestep()
                     server_to_client_latency = (receive_time - timed_actions[0].get_timestamp()) * 1000
@@ -1799,51 +539,24 @@ class RobotClient:
                     )
 
                 # Update action queue
-                transition_id = (
-                    self._next_chunk_transition_id()
-                    if self.config.debug_chunk_transitions
-                    or self.config.debug_weighted_aggregation
-                    else None
-                )
                 start_time = time.perf_counter()
-                self._aggregate_action_queues(
-                    timed_actions,
-                    self.config.aggregate_fn,
-                    transition_id=transition_id,
-                    source_prefetch_request_id=source_prefetch_request_id,
-                )
+                self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)
                 queue_update_time = time.perf_counter() - start_time
-
-                source_timestep = timed_actions[0].get_timestep() if timed_actions else None
-                self._handle_prefetch_acknowledgement(
-                    source_prefetch_request_id,
-                    source_timestep,
-                )
-
-                if capture_transition:
-                    new_size, new_timesteps = self._inspect_action_queue()
-                else:
-                    new_size, new_timesteps = 0, []
-                if self.config.debug_chunk_transitions:
-                    assert transition_id is not None
-                    self._log_chunk_transition(
-                        transition_id=transition_id,
-                        latest_action=latest_action,
-                        old_timesteps=old_timesteps,
-                        incoming_timesteps=incoming_timesteps,
-                        updated_timesteps=new_timesteps,
-                        source_prefetch_request_id=source_prefetch_request_id,
-                        queue_update_time_ms=queue_update_time * 1000,
-                    )
 
                 self.must_go.set()  # after receiving actions, next empty queue triggers must-go processing!
 
                 if verbose:
+                    # Get queue state after changes
+                    new_size, new_timesteps = self._inspect_action_queue()
+
+                    with self.latest_action_lock:
+                        latest_action = self.latest_action
+
                     self.logger.info(
                         f"Latest action: {latest_action} | "
-                        f"Old action steps: {old_timesteps[:1]}:{old_timesteps[-1:]} | "
-                        f"Incoming action steps: {incoming_timesteps[:1]}:{incoming_timesteps[-1:]} | "
-                        f"Updated action steps: {new_timesteps[:1]}:{new_timesteps[-1:]}"
+                        f"Old action steps: {old_timesteps[0]}:{old_timesteps[-1]} | "
+                        f"Incoming action steps: {incoming_timesteps[0]}:{incoming_timesteps[-1]} | "
+                        f"Updated action steps: {new_timesteps[0]}:{new_timesteps[-1]}"
                     )
                     self.logger.debug(
                         f"Queue update complete ({queue_update_time:.6f}s) | "
@@ -1866,14 +579,6 @@ class RobotClient:
     def control_loop_action(self, verbose: bool = False) -> dict[str, Any]:
         """Reading and performing actions in local queue"""
 
-        if self.config.debug_chunk_transitions:
-            action_monotonic_time = time.perf_counter()
-            if self._previous_action_monotonic_time is not None:
-                self._recent_action_periods.append(
-                    action_monotonic_time - self._previous_action_monotonic_time
-                )
-            self._previous_action_monotonic_time = action_monotonic_time
-
         # Lock only for queue operations
         get_start = time.perf_counter()
         with self.action_queue_lock:
@@ -1886,58 +591,18 @@ class RobotClient:
 
         logging_actions = self._action_tensor_to_action_dict(timed_action.get_action())
 
-        previous_executed_timestep = self.previous_executed_timestep
-        current_executed_timestep = timed_action.get_timestep()
-        timestep_delta = (
-            current_executed_timestep - previous_executed_timestep
-            if previous_executed_timestep is not None
-            else None
-        )
-        self.previous_executed_timestep = current_executed_timestep
-
         with self.latest_action_lock:
-            self.latest_action = current_executed_timestep
-            if self.config.debug_weighted_aggregation:
-                self.latest_executed_action = [
-                    logging_actions[name] for name in self.robot.action_features
-                ]
+            self.latest_action = timed_action.get_timestep()
 
         _performed_action = self.robot.send_action(logging_actions)
 
         # Loggggging action to file
-        prefetch_state = self._prefetch_state_snapshot()
-        with self.observation_debug_lock:
-            observation_transport = self._pending_observation_transport_debug
-            self._pending_observation_transport_debug = None
-        observation_timings = None
-        if observation_transport is not None:
-            transport_timings = observation_transport["timings_ms"]
-            send_timings = transport_timings["send_observation"]
-            observation_timings = {
-                "robot_get_observation": transport_timings["robot_get_observation"],
-                "image_resize": transport_timings["image_resize"],
-                "send_observation": send_timings["total_ms"],
-                "send_observation_breakdown": send_timings,
-                "total": transport_timings["total"],
-            }
 
         record = {
             "wall_time": time.time(),
             "policy_timestamp": timed_action.get_timestamp(),
             "timestep": timed_action.get_timestep(),
             "action": logging_actions,
-            "source_prefetch_request_id": getattr(
-                timed_action, "source_prefetch_request_id", None
-            ),
-            "previous_executed_timestep": previous_executed_timestep,
-            "current_executed_timestep": current_executed_timestep,
-            "timestep_delta": timestep_delta,
-            "timestep_continuity_warning": (
-                timestep_delta is not None and timestep_delta != 1
-            ),
-            "timings_ms": {"observation": observation_timings},
-            "observation_transport": observation_transport,
-            **prefetch_state,
         }
 
         with open(FINAL_ACTION_LOG, "a", encoding="utf-8") as f:
@@ -1963,146 +628,25 @@ class RobotClient:
 
     def _ready_to_send_observation(self):
         """Flags when the client is ready to send an observation"""
-        if not self.uses_grpc_backend:
-            with self.action_queue_lock:
-                return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
-
-        queue_size, queue_ratio = self._action_queue_ratio()
-        with self.latest_action_lock:
-            latest_action = self.latest_action
-        now = time.perf_counter()
-
-        timed_out_request_id = None
-        timed_out_duration_ms = None
-        with self.prefetch_state_lock:
-            if (
-                self.prefetch_request_pending
-                and self.prefetch_request_sent_monotonic_time is not None
-                and now - self.prefetch_request_sent_monotonic_time
-                >= self.config.prefetch_request_timeout
-            ):
-                timed_out_request_id = self.pending_prefetch_request_id
-                timed_out_duration_ms = (
-                    now - self.prefetch_request_sent_monotonic_time
-                ) * 1000
-                self.prefetch_request_pending = False
-                self.pending_prefetch_request_id = None
-                self.pending_prefetch_observation_timestep = None
-                self.prefetch_request_sent_monotonic_time = None
-                self._prefetch_trigger_request_id = None
-                # Re-arm crossing so a non-empty queue retries once; an empty queue uses must_go.
-                self._previous_action_queue_ratio = self._chunk_size_threshold + 1.0
-                self._prefetch_pending_skip_logged = False
-
-        if timed_out_request_id is not None:
-            self._log_prefetch_event(
-                "prefetch_timeout",
-                timestep=max(latest_action, 0),
-                queue_size=queue_size,
-                queue_ratio=queue_ratio,
-                request_id=timed_out_request_id,
-                pending_duration_ms=timed_out_duration_ms,
-            )
-            self._log_prefetch_event(
-                "prefetch_pending_cleared",
-                timestep=max(latest_action, 0),
-                queue_size=queue_size,
-                queue_ratio=queue_ratio,
-                request_id=timed_out_request_id,
-                clear_reason="timeout",
-            )
-
-        triggered_request_id = None
-        previous_queue_ratio = None
-        log_pending_skip = False
-        skipped_pending_request_id = None
         with self.action_queue_lock:
-            queue_empty = self.action_queue.empty()
-
-        with self.prefetch_state_lock:
-            previous_queue_ratio = self._previous_action_queue_ratio
-            empty_queue_fallback = queue_empty
-
-            if self.prefetch_request_pending:
-                ready = False
-                if queue_ratio <= self._chunk_size_threshold and not self._prefetch_pending_skip_logged:
-                    self._prefetch_pending_skip_logged = True
-                    log_pending_skip = True
-                    skipped_pending_request_id = self.pending_prefetch_request_id
-            elif empty_queue_fallback:
-                # Preserve startup/emergency retries. The observation sender marks the
-                # first empty-queue request as must_go and clears it after a successful send.
-                ready = True
-            else:
-                threshold_crossed = (
-                    previous_queue_ratio is not None
-                    and previous_queue_ratio > self._chunk_size_threshold
-                    and queue_ratio <= self._chunk_size_threshold
-                )
-                ready = threshold_crossed
-                if threshold_crossed:
-                    self._prefetch_request_sequence += 1
-                    triggered_request_id = self._prefetch_request_sequence
-                    self.prefetch_request_pending = True
-                    self.pending_prefetch_request_id = triggered_request_id
-                    self.pending_prefetch_observation_timestep = max(latest_action, 0)
-                    self.prefetch_request_sent_monotonic_time = now
-                    self._prefetch_trigger_request_id = triggered_request_id
-                    self._prefetch_pending_skip_logged = False
-
-            self._previous_action_queue_ratio = queue_ratio
-
-        if log_pending_skip:
-            self._log_prefetch_event(
-                "prefetch_skipped_already_pending",
-                timestep=max(latest_action, 0),
-                queue_size=queue_size,
-                queue_ratio=queue_ratio,
-                request_id=skipped_pending_request_id,
-            )
-
-        if triggered_request_id is not None:
-            self._log_prefetch_event(
-                "prefetch_triggered",
-                timestep=max(latest_action, 0),
-                queue_size=queue_size,
-                queue_ratio=queue_ratio,
-                request_id=triggered_request_id,
-                previous_queue_ratio=previous_queue_ratio,
-                threshold=self._chunk_size_threshold,
-            )
-
-        return ready
+            return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
 
     def control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
-        prefetch_request_id = None
-        observation = None
         try:
             # Get serialized observation bytes from the function
             start_time = time.perf_counter()
 
-            capture_start = time.perf_counter()
             raw_observation: RawObservation = self.robot.get_observation()
-            capture_time_ms = (time.perf_counter() - capture_start) * 1000
-            transport_observation, image_resize_ms, image_transport = (
-                self._resize_observation_images_for_transport(raw_observation)
-            )
             raw_observation["task"] = task
-            if transport_observation is not raw_observation:
-                transport_observation["task"] = task
 
             with self.latest_action_lock:
                 latest_action = self.latest_action
 
             observation = TimedObservation(
                 timestamp=time.time(),  # need time.time() to compare timestamps across client and server
-                observation=transport_observation,
+                observation=raw_observation,
                 timestep=max(latest_action, 0),
             )
-            prefetch_request_id = self._consume_prefetch_trigger(observation.get_timestep())
-            if prefetch_request_id is not None:
-                observation.prefetch_requested = True
-                observation.prefetch_request_id = prefetch_request_id
 
             obs_capture_time = time.perf_counter() - start_time
 
@@ -2111,40 +655,10 @@ class RobotClient:
                 observation.must_go = self.must_go.is_set() and self.action_queue.empty()
                 current_queue_size = self.action_queue.qsize()
 
-            observation_sent = self.send_observation(observation)
-            with self.observation_debug_lock:
-                self._pending_observation_transport_debug = {
-                    "observation_timestamp": observation.get_timestamp(),
-                    "observation_timestep": observation.get_timestep(),
-                    "image_resize_scale": self.config.image_resize_scale,
-                    "images": image_transport,
-                    "timings_ms": {
-                        "robot_get_observation": capture_time_ms,
-                        "image_resize": image_resize_ms,
-                        "send_observation": self._last_send_observation_diagnostics,
-                        "total": (time.perf_counter() - start_time) * 1000,
-                    },
-                }
+            _ = self.send_observation(observation)
 
-            if prefetch_request_id is not None:
-                if observation_sent:
-                    self._mark_prefetch_sent(
-                        prefetch_request_id,
-                        observation.get_timestep(),
-                    )
-                else:
-                    self._rollback_prefetch_request(
-                        prefetch_request_id,
-                        observation.get_timestep(),
-                        "send_failed",
-                    )
-
-            self.logger.debug(
-                f"QUEUE SIZE: {current_queue_size} (Must go: {observation.must_go}, "
-                f"Prefetch: {observation.prefetch_requested}, "
-                f"Prefetch request id: {observation.prefetch_request_id})"
-            )
-            if observation.must_go and observation_sent:
+            self.logger.debug(f"QUEUE SIZE: {current_queue_size} (Must go: {observation.must_go})")
+            if observation.must_go:
                 # must-go event will be set again after receiving actions
                 self.must_go.clear()
 
@@ -2165,20 +679,6 @@ class RobotClient:
             return raw_observation
 
         except Exception as e:
-            if prefetch_request_id is None:
-                with self.prefetch_state_lock:
-                    prefetch_request_id = self._prefetch_trigger_request_id
-            if prefetch_request_id is not None:
-                with self.latest_action_lock:
-                    latest_action = self.latest_action
-                observation_timestep = (
-                    observation.get_timestep() if observation is not None else max(latest_action, 0)
-                )
-                self._rollback_prefetch_request(
-                    prefetch_request_id,
-                    observation_timestep,
-                    "observation_sender_exception",
-                )
             self.logger.error(f"Error in observation sender: {e}")
 
 
@@ -2371,49 +871,17 @@ class RobotClient:
                 timed_actions = self._convert_remote_actions(action_dict, observation)
                 self.action_chunk_size = max(self.action_chunk_size, len(timed_actions))
 
-                capture_transition = self.config.debug_chunk_transitions or verbose
-                if capture_transition and timed_actions:
+                if verbose and timed_actions:
                     old_size, old_timesteps = self._inspect_action_queue()
+                    if not old_timesteps:
+                        with self.latest_action_lock:
+                            old_timesteps = [self.latest_action]
                 else:
                     old_size, old_timesteps = 0, []
-                with self.latest_action_lock:
-                    latest_action = self.latest_action
-                incoming_timesteps = (
-                    [action.get_timestep() for action in timed_actions]
-                    if capture_transition
-                    else []
-                )
 
                 queue_update_start = time.perf_counter()
-                transition_id = (
-                    self._next_chunk_transition_id()
-                    if self.config.debug_chunk_transitions
-                    or self.config.debug_weighted_aggregation
-                    else None
-                )
-                self._aggregate_action_queues(
-                    timed_actions,
-                    self.config.aggregate_fn,
-                    transition_id=transition_id,
-                    source_prefetch_request_id=None,
-                )
+                self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)
                 queue_update_time = time.perf_counter() - queue_update_start
-
-                if capture_transition:
-                    new_size, new_timesteps = self._inspect_action_queue()
-                else:
-                    new_size, new_timesteps = 0, []
-                if self.config.debug_chunk_transitions:
-                    assert transition_id is not None
-                    self._log_chunk_transition(
-                        transition_id=transition_id,
-                        latest_action=latest_action,
-                        old_timesteps=old_timesteps,
-                        incoming_timesteps=incoming_timesteps,
-                        updated_timesteps=new_timesteps,
-                        source_prefetch_request_id=None,
-                        queue_update_time_ms=queue_update_time * 1000,
-                    )
 
                 # After receiving actions, the next empty queue triggers must-go processing.
                 self.must_go.set()
@@ -2424,6 +892,9 @@ class RobotClient:
                 )
 
                 if verbose and timed_actions:
+                    new_size, new_timesteps = self._inspect_action_queue()
+                    incoming_timesteps = [a.get_timestep() for a in timed_actions]
+
                     self.logger.info(
                         f"Received {self.remote_backend_name} action chunk for step #{incoming_timesteps[0]} | "
                         f"Incoming actions: {incoming_timesteps[0]}:{incoming_timesteps[-1]} | "

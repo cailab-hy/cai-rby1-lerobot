@@ -1,6 +1,6 @@
 # RB-Y1
 
-[Rainbow Robotics RB-Y1](https://www.rainbow-robotics.com/rby1) is a bimanual robot designed for physical AI research. This repository provides a LeRobot plugin for controlling RB-Y1 with a leader arm teleoperation setup, enabling intuitive data collection and experimentation.
+[Rainbow Robotics RB-Y1](https://rainbow-robotics.com/en/products/rb-y1/) is a bimanual robot designed for physical AI research. This repository provides a LeRobot plugin for controlling RB-Y1 with a leader arm teleoperation setup, enabling intuitive data collection and experimentation.
 
 ## Overview
 <img width="1599" height="905" alt="Image" src="https://github.com/user-attachments/assets/bbea002e-b8b5-4a8b-8aae-a5fb38f830f0" />
@@ -57,9 +57,12 @@ conda activate lerobot
 ```
 
 ```bash
+# 0. Install required lerobot packages
+pip install -e ".[core_scripts]"
+
 # 1. Create a working directory and move into it
 #    (to avoid accidentally cloning inside the LeRobot package folder)
-mkdir -p ~/rby1-lerobot && cd ~/rby1-lerobot
+mkdir -p ~/rby1-lerobot && cd ~
 
 # 2. Install the RB-Y1 SDK
 pip install rby1-sdk
@@ -71,7 +74,6 @@ cd rby1-lerobot
 # 4. Install the RB-Y1 robot, teleoperator plugins and dependencies
 pip install -e lerobot-robot-rby1
 pip install -e lerobot-teleoperator-rby1
-pip install pynput lerobot[dataset]
 
 # 5. (for RB-Y1's UPC only) Install pyrealsense2
 #    The official pyrealsense2 package on PyPI does not support ARM64.
@@ -119,7 +121,7 @@ Add one or more cameras by passing a `cameras` configuration:
 lerobot-teleoperate \
   --robot.type=rby1 \
   --robot.address=192.168.30.1:50051 \
-  --robot.cameras='{"front": {"type": "realsense", "serial_number_or_name": "XXXXXXXXX", "fps": 30, "width": 640, "height": 480}}' \
+  --robot.cameras='{"front": {"type": "intelrealsense", "serial_number_or_name": "XXXXXXXXX", "fps": 30, "width": 640, "height": 480}}' \
   --teleop.type=rby1_leader_arm \
   --display_data=true
 ```
@@ -200,8 +202,8 @@ The LeRobot framework is installed as a Python package dependency (`pip install 
 
 ## Resources
 
-- [Rainbow Robotics Website](https://www.rainbow-robotics.com)
-- [RB-Y1 Product Page](https://www.rainbow-robotics.com/en_rby1)
+- [Rainbow Robotics Website](https://rainbow-robotics.com/en/)
+- [RB-Y1 Product Page](https://rainbow-robotics.com/en/products/rb-y1/)
 - [RB-Y1 Documentation](https://rainbowrobotics.github.io/rby1-dev/)
 - [LeRobot Documentation](https://huggingface.co/docs/lerobot)
 - [LeRobot Installation Guide](https://huggingface.co/docs/lerobot/installation)

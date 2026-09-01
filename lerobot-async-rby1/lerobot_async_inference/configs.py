@@ -26,21 +26,15 @@ from .constants import (
     DEFAULT_ZMQ_TIMEOUT_MS,
     SUPPORTED_BACKENDS,
 )
+from .image_transport import validate_image_resize_scale
 
 # Aggregate function registry for CLI usage
-WEIGHTED_AVERAGE_WEIGHTS = (0.3, 0.7)
 AGGREGATE_FUNCTIONS = {
-    "weighted_average": lambda old, new: (
-        WEIGHTED_AVERAGE_WEIGHTS[0] * old + WEIGHTED_AVERAGE_WEIGHTS[1] * new
-    ),
+    "weighted_average": lambda old, new: 0.3 * old + 0.7 * new,
     "latest_only": lambda old, new: new,
     "average": lambda old, new: 0.5 * old + 0.5 * new,
     "conservative": lambda old, new: 0.7 * old + 0.3 * new,
 }
-
-# Debug metadata is attached to the exact callable used by the queue merger, so the
-# logger never has to infer weights from a separately maintained schedule.
-AGGREGATE_FUNCTIONS["weighted_average"].aggregation_weights = WEIGHTED_AVERAGE_WEIGHTS
 
 
 def get_aggregate_function(name: str) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
@@ -73,19 +67,6 @@ class PolicyServerConfig:
         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
     )
 
-    # Optional observation lifecycle instrumentation. This does not affect the policy input or queues.
-    debug_observation_lifecycle: bool = field(
-        default=False,
-        metadata={"help": "Write asynchronous observation lifecycle events as JSONL"},
-    )
-    observation_lifecycle_log_dir: str = field(
-        default="logs", metadata={"help": "Directory for observation lifecycle JSONL files"}
-    )
-    observation_lifecycle_logger_queue_maxsize: int = field(
-        default=10_000,
-        metadata={"help": "Maximum buffered lifecycle events before debug records are dropped"},
-    )
-
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.port < 1 or self.port > 65535:
@@ -99,12 +80,6 @@ class PolicyServerConfig:
 
         if self.obs_queue_timeout < 0:
             raise ValueError(f"obs_queue_timeout must be non-negative, got {self.obs_queue_timeout}")
-
-        if self.observation_lifecycle_logger_queue_maxsize <= 0:
-            raise ValueError(
-                "observation_lifecycle_logger_queue_maxsize must be positive, got "
-                f"{self.observation_lifecycle_logger_queue_maxsize}"
-            )
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "PolicyServerConfig":
@@ -125,11 +100,6 @@ class PolicyServerConfig:
             "environment_dt": self.environment_dt,
             "inference_latency": self.inference_latency,
             "logging": self.logging,
-            "debug_observation_lifecycle": self.debug_observation_lifecycle,
-            "observation_lifecycle_log_dir": self.observation_lifecycle_log_dir,
-            "observation_lifecycle_logger_queue_maxsize": (
-                self.observation_lifecycle_logger_queue_maxsize
-            ),
         }
 
 
@@ -178,22 +148,18 @@ class RobotClientConfig:
     # Control behavior configuration
     chunk_size_threshold: float = field(default=0.5, metadata={"help": "Threshold for chunk size control"})
     fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
-    prefetch_request_timeout: float = field(
-        default=2.0,
-        metadata={
-            "help": "Seconds to wait for a prefetch acknowledgement before allowing fallback/retry"
-        },
+    image_resize_scale: float = field(
+        default=1.0,
+        metadata={"help": "Scale applied to camera images immediately before network transport"},
+    )
+    jpeg_compression: bool = field(
+        default=False,
+        metadata={"help": "Compress camera images as JPEG immediately before network transport"},
     )
     image_crop_params: dict[str, tuple[int, int, int, int]] = field(
         default_factory=dict,
         metadata={
             "help": "Optional per-camera crop parameters as (top, left, height, width), applied on the client before sending observations"
-        },
-    )
-    image_resize_scale: float = field(
-        default=1.0,
-        metadata={
-            "help": "Scale applied to camera images before gRPC transport (for example, 0.5 sends 640x480 as 320x240)"
         },
     )
     zmq_timeout_ms: int = field(
@@ -218,34 +184,10 @@ class RobotClientConfig:
         default="weighted_average",
         metadata={"help": f"Name of aggregate function to use. Options: {list(AGGREGATE_FUNCTIONS.keys())}"},
     )
-    arm_temporal_crossfade: bool = field(
-        default=False,
-        metadata={
-            "help": "Apply a linear temporal cross-fade only to arm-joint dimensions in blended overlap actions"
-        },
-    )
 
     # Debug configuration
     debug_visualize_queue_size: bool = field(
         default=False, metadata={"help": "Visualize the action queue size"}
-    )
-    debug_chunk_transitions: bool = field(
-        default=False,
-        metadata={
-            "help": "Write asynchronous action chunk transition diagnostics as JSONL"
-        },
-    )
-    debug_weighted_aggregation: bool = field(
-        default=False,
-        metadata={"help": "Write exact weighted action aggregation diagnostics as JSONL"},
-    )
-    weighted_aggregation_logger_queue_maxsize: int = field(
-        default=1_000,
-        metadata={"help": "Maximum queued weighted aggregation transitions before dropping debug events"},
-    )
-    direction_reversal_epsilon: float = field(
-        default=1e-8,
-        metadata={"help": "Minimum absolute action delta used by direction-reversal diagnostics"},
     )
 
     @property
@@ -265,6 +207,12 @@ class RobotClientConfig:
             if not self.policy_type:
                 raise ValueError("policy_type cannot be empty when backend='grpc'")
 
+            if not self.pretrained_name_or_path:
+                raise ValueError("pretrained_name_or_path cannot be empty when backend='grpc'")
+
+            if not self.policy_device:
+                raise ValueError("policy_device cannot be empty when backend='grpc'")
+
         if not self.client_device:
             raise ValueError("client_device cannot be empty")
 
@@ -274,29 +222,10 @@ class RobotClientConfig:
         if self.fps <= 0:
             raise ValueError(f"fps must be positive, got {self.fps}")
 
-        if self.prefetch_request_timeout <= 0:
-            raise ValueError(
-                f"prefetch_request_timeout must be positive, got {self.prefetch_request_timeout}"
-            )
-
-        if self.image_resize_scale <= 0:
-            raise ValueError(
-                f"image_resize_scale must be positive, got {self.image_resize_scale}"
-            )
-
-        if self.weighted_aggregation_logger_queue_maxsize <= 0:
-            raise ValueError(
-                "weighted_aggregation_logger_queue_maxsize must be positive, got "
-                f"{self.weighted_aggregation_logger_queue_maxsize}"
-            )
-
-        if self.direction_reversal_epsilon < 0:
-            raise ValueError(
-                f"direction_reversal_epsilon must be non-negative, got {self.direction_reversal_epsilon}"
-            )
-
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
+
+        validate_image_resize_scale(self.image_resize_scale)
 
         if self.zmq_timeout_ms <= 0:
             raise ValueError(f"zmq_timeout_ms must be positive, got {self.zmq_timeout_ms}")
@@ -345,22 +274,15 @@ class RobotClientConfig:
             "client_device": self.client_device,
             "chunk_size_threshold": self.chunk_size_threshold,
             "fps": self.fps,
-            "prefetch_request_timeout": self.prefetch_request_timeout,
             "actions_per_chunk": self.actions_per_chunk,
-            "image_crop_params": self.image_crop_params,
             "image_resize_scale": self.image_resize_scale,
+            "jpeg_compression": self.jpeg_compression,
+            "image_crop_params": self.image_crop_params,
             "zmq_timeout_ms": self.zmq_timeout_ms,
             "front_camera_key": self.front_camera_key,
             "left_wrist_camera_key": self.left_wrist_camera_key,
             "right_wrist_camera_key": self.right_wrist_camera_key,
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
-            "debug_chunk_transitions": self.debug_chunk_transitions,
-            "arm_temporal_crossfade": self.arm_temporal_crossfade,
-            "debug_weighted_aggregation": self.debug_weighted_aggregation,
-            "weighted_aggregation_logger_queue_maxsize": (
-                self.weighted_aggregation_logger_queue_maxsize
-            ),
-            "direction_reversal_epsilon": self.direction_reversal_epsilon,
             "aggregate_fn_name": self.aggregate_fn_name,
         }
