@@ -60,13 +60,15 @@ python -m lerobot.async_inference.robot_client \
 
 """
 
+import json
 import logging
 import pickle  # nosec
 import threading
-import time, json
-from datetime import datetime
+import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import asdict, replace
+from datetime import datetime
 from pprint import pformat
 from queue import Empty, Queue
 from typing import Any
@@ -111,7 +113,7 @@ from .policy.pi05_zmq import (
 
 
 
-from .configs import RobotClientConfig
+from .configs import RobotClientConfig, cosine_ramp, cosine_ramp_alpha
 from .helpers import (
     Action,
     FPSTracker,
@@ -188,6 +190,7 @@ class RobotClient:
                 lerobot_features,
                 config.actions_per_chunk,
                 config.policy_device,
+                timing_diagnostics=config.timing_diagnostics,
             )
             self.channel = grpc.insecure_channel(
                 self.server_address, grpc_channel_options(initial_backoff=f"{config.environment_dt:.4f}s")
@@ -222,6 +225,7 @@ class RobotClient:
         # Initialize client side variables
         self.latest_action_lock = threading.Lock()
         self.latest_action = -1
+        self.latest_action_tensor = None
         self.action_chunk_size = -1
 
         self._chunk_size_threshold = config.chunk_size_threshold
@@ -231,8 +235,24 @@ class RobotClient:
         # maxsize=1 avoids running inference on stale observations.
         self.remote_observation_queue = Queue(maxsize=1)
         self.action_queue_lock = threading.Lock()  # Protect queue operations
+        # Protected by action_queue_lock. True includes the short reservation
+        # window between threshold detection and SendObservations completion.
+        self._refill_in_flight = False
+        self._refill_request_sent = False
+        self._refill_request_queue_size = None
+        self._refill_request_queue_ratio = None
         self.action_queue_size = []
         self.start_barrier = threading.Barrier(2)  # 2 threads: action receiver, control loop
+
+        # Diagnostic state is allocated only when explicitly requested. It contains
+        # scalar timings and timestep metadata, never actions or observations.
+        self._timing_history = deque(maxlen=10) if config.timing_diagnostics else None
+        self._last_action_perf_time = None
+        self._last_action_timestep = None
+        if config.timing_diagnostics and hasattr(self.robot, "_timing_diagnostics"):
+            # Rby1 consumes this private opt-in marker for per-camera read timing.
+            # Other robot implementations simply ignore it.
+            self.robot._timing_diagnostics = True
 
         # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=self.config.fps)
@@ -275,6 +295,7 @@ class RobotClient:
         """Start the robot client and connect to the policy server"""
         try:
             if self.uses_grpc_backend:
+                self._clear_refill_in_flight()
                 # client-server handshake
                 start_time = time.perf_counter()
                 self.stub.Ready(services_pb2.Empty())
@@ -326,6 +347,7 @@ class RobotClient:
     def stop(self):
         """Stop the robot client"""
         self.shutdown_event.set()
+        self._clear_refill_in_flight()
 
         self.robot.disconnect()
         self.logger.debug("Robot disconnected")
@@ -339,9 +361,24 @@ class RobotClient:
             self.remote_client = None
             self.logger.debug("Remote ZMQ client closed")
 
+    def _clear_refill_in_flight(self) -> bool:
+        """Clear the refill state and return its previous value."""
+        with self.action_queue_lock:
+            was_in_flight = self._refill_in_flight
+            self._refill_in_flight = False
+            self._refill_request_sent = False
+            self._refill_request_queue_size = None
+            self._refill_request_queue_ratio = None
+        return was_in_flight
+
+    def _refill_rpc_state(self) -> tuple[bool, bool]:
+        with self.action_queue_lock:
+            return self._refill_in_flight, self._refill_request_sent
+
     def send_observation(
         self,
         obs: TimedObservation,
+        timing: dict[str, Any] | None = None,
     ) -> bool:
         """Send observation to the policy server.
         Returns True if the observation was sent successfully, False otherwise."""
@@ -354,6 +391,10 @@ class RobotClient:
             raise ValueError("Input observation needs to be a TimedObservation!")
 
         observation_to_send = obs
+        transport_preprocess_ms = 0.0
+        resize_ms = 0.0
+        jpeg_encode_ms = 0.0
+        transport_bytes = 0
         if self.config.image_resize_scale != 1.0 or self.config.jpeg_compression:
             transport_observation, image_stats = encode_observation_images(
                 obs.get_observation(),
@@ -362,6 +403,10 @@ class RobotClient:
                 self.config.jpeg_compression,
             )
             observation_to_send = replace(obs, observation=transport_observation)
+            transport_preprocess_ms = image_stats.total_time * 1000
+            resize_ms = image_stats.resize_time * 1000
+            jpeg_encode_ms = image_stats.jpeg_encode_time * 1000
+            transport_bytes = image_stats.transport_bytes
             compression_ratio = (
                 image_stats.original_bytes / image_stats.transport_bytes
                 if image_stats.transport_bytes
@@ -384,6 +429,16 @@ class RobotClient:
         serialize_time = time.perf_counter() - start_time
         self.logger.debug(f"Observation serialization time: {serialize_time:.6f}s")
 
+        if timing is not None:
+            timing.update(
+                transport_preprocess_ms=transport_preprocess_ms,
+                resize_ms=resize_ms,
+                jpeg_encode_ms=jpeg_encode_ms,
+                transport_bytes=transport_bytes,
+                serialized_bytes=len(observation_bytes),
+                serialization_ms=serialize_time * 1000,
+            )
+
         try:
             observation_iterator = send_bytes_in_chunks(
                 observation_bytes,
@@ -391,7 +446,12 @@ class RobotClient:
                 log_prefix="[CLIENT] Observation",
                 silent=True,
             )
+            grpc_start = time.perf_counter() if timing is not None else 0.0
             _ = self.stub.SendObservations(observation_iterator)
+            if timing is not None:
+                timing["grpc_send_observation_ms"] = (
+                    time.perf_counter() - grpc_start
+                ) * 1000
             obs_timestep = obs.get_timestep()
             self.logger.debug(f"Sent observation #{obs_timestep} | ")
 
@@ -412,65 +472,210 @@ class RobotClient:
         self,
         incoming_actions: list[TimedAction],
         aggregate_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+        timing: dict[str, Any] | None = None,
     ):
-        """Finds the same timestep actions in the queue and aggregates them using the aggregate_fn"""
+        """Merge queued and incoming future actions, aggregating matching timesteps."""
+        diagnostics = timing is not None
+        aggregate_start = time.perf_counter() if diagnostics else 0.0
         if aggregate_fn is None:
             # default aggregate function: take the latest action
             def aggregate_fn(x1, x2):
                 return x2
 
-
-        future_action_queue = Queue()
+        snapshot_wait_start = time.perf_counter() if diagnostics else 0.0
         with self.action_queue_lock:
-            internal_queue = self.action_queue.queue
-
-        current_action_queue = {action.get_timestep(): action.get_action() for action in internal_queue}
+            snapshot_acquired = time.perf_counter() if diagnostics else 0.0
+            internal_queue = list(self.action_queue.queue)
+        snapshot_end = time.perf_counter() if diagnostics else 0.0
 
         with self.latest_action_lock:
             latest_action = self.latest_action
+            latest_action_tensor = getattr(self, "latest_action_tensor", None)
 
+        merge_compute_start = time.perf_counter() if diagnostics else 0.0
+        old_by_timestep = {
+            action.get_timestep(): action
+            for action in internal_queue
+            if action.get_timestep() > latest_action
+        }
+        incoming_by_timestep = {
+            action.get_timestep(): action
+            for action in incoming_actions
+            if action.get_timestep() > latest_action
+        }
 
-        ##############################################################
-        ######  새로 오는 action들 처음 N개 버리고 그 뒤부터 합치는 방식 ######
+        old_timesteps = set(old_by_timestep)
+        incoming_timesteps = set(incoming_by_timestep)
+        overlap_timesteps = sorted(old_timesteps & incoming_timesteps)
+        overlap_index_by_timestep = {
+            timestep: overlap_index
+            for overlap_index, timestep in enumerate(overlap_timesteps)
+        }
+        use_cosine_ramp = aggregate_fn is cosine_ramp
+        merge_compute_end = time.perf_counter() if diagnostics else 0.0
 
-        guard_steps = 5
-        guard_until = latest_action + guard_steps
-        # old 2개 더 남김
-        for old_action in internal_queue:
-            if latest_action < old_action.get_timestep() <= guard_until:
-                future_action_queue.put(old_action)
-        ##############################################################
-
-        for new_action in incoming_actions:
-            # with self.latest_action_lock:
-            #     latest_action = self.latest_action
-
-            # New action is older than the latest action in the queue, skip it
-            if new_action.get_timestep() <= latest_action:
-                continue
-
-            if new_action.get_timestep() <= guard_until:
-                continue
-
-            # If the new action's timestep is not in the current action queue, add it directly
-            elif new_action.get_timestep() not in current_action_queue:
-                future_action_queue.put(new_action)
-                continue
-
-            # If the new action's timestep is in the current action queue, aggregate it
-            # TODO: There is probably a way to do this with broadcasting of the two action tensors
-            future_action_queue.put(
-                TimedAction(
-                    timestamp=new_action.get_timestamp(),
-                    timestep=new_action.get_timestep(),
-                    action=aggregate_fn(
-                        current_action_queue[new_action.get_timestep()], new_action.get_action()
-                    ),
+        queue_rebuild_start = time.perf_counter() if diagnostics else 0.0
+        future_action_queue = Queue()
+        for timestep in sorted(old_timesteps | incoming_timesteps):
+            if timestep not in old_by_timestep:
+                future_action_queue.put(incoming_by_timestep[timestep])
+            elif timestep not in incoming_by_timestep:
+                future_action_queue.put(old_by_timestep[timestep])
+            else:
+                old_action = old_by_timestep[timestep]
+                new_action = incoming_by_timestep[timestep]
+                if use_cosine_ramp:
+                    aggregated_action = cosine_ramp(
+                        old_action.get_action(),
+                        new_action.get_action(),
+                        overlap_index=overlap_index_by_timestep[timestep],
+                        overlap_count=len(overlap_timesteps),
+                    )
+                else:
+                    aggregated_action = aggregate_fn(
+                        old_action.get_action(), new_action.get_action()
+                    )
+                future_action_queue.put(
+                    TimedAction(
+                        timestamp=new_action.get_timestamp(),
+                        timestep=timestep,
+                        action=aggregated_action,
+                    )
                 )
+        queue_rebuild_end = time.perf_counter() if diagnostics else 0.0
+
+        if use_cosine_ramp and diagnostics and overlap_timesteps:
+            overlap_count = len(overlap_timesteps)
+            alpha_first = cosine_ramp_alpha(0, overlap_count)
+            alpha_mid = cosine_ramp_alpha(overlap_count // 2, overlap_count)
+            alpha_last = cosine_ramp_alpha(overlap_count - 1, overlap_count)
+            self.logger.debug(
+                "[COSINE_RAMP] overlap_count=%d first_timestep=%d last_timestep=%d "
+                "alpha_first=%.4f alpha_mid=%.4f alpha_last=%.4f",
+                overlap_count,
+                overlap_timesteps[0],
+                overlap_timesteps[-1],
+                alpha_first,
+                alpha_mid,
+                alpha_last,
             )
 
+            final_by_timestep = {
+                action.get_timestep(): action for action in future_action_queue.queue
+            }
+            first_final_timestep = min(final_by_timestep, default=None)
+            start_metrics = self._action_boundary_metrics(
+                latest_action_tensor,
+                (
+                    final_by_timestep[first_final_timestep].get_action()
+                    if first_final_timestep is not None
+                    else None
+                ),
+            )
+            first_incoming_only_after_overlap = min(
+                (
+                    timestep
+                    for timestep in incoming_timesteps - old_timesteps
+                    if timestep > overlap_timesteps[-1]
+                ),
+                default=None,
+            )
+            end_metrics = self._action_boundary_metrics(
+                final_by_timestep[overlap_timesteps[-1]].get_action(),
+                (
+                    final_by_timestep[first_incoming_only_after_overlap].get_action()
+                    if first_incoming_only_after_overlap is not None
+                    else None
+                ),
+            )
+            self.logger.debug(
+                "[COSINE_RAMP][BOUNDARY] start_transition_max_abs_delta=%s "
+                "start_transition_l2_delta=%s end_transition_max_abs_delta=%s "
+                "end_transition_l2_delta=%s",
+                self._format_boundary_metric(start_metrics, "max_abs_delta"),
+                self._format_boundary_metric(start_metrics, "l2_delta"),
+                self._format_boundary_metric(end_metrics, "max_abs_delta"),
+                self._format_boundary_metric(end_metrics, "l2_delta"),
+            )
+
+        self.logger.debug(
+            "Action queue merge: old=%d | incoming=%d | old_only=%d | overlap=%d | "
+            "incoming_only=%d | final=%d",
+            len(old_timesteps),
+            len(incoming_timesteps),
+            len(old_timesteps - incoming_timesteps),
+            len(old_timesteps & incoming_timesteps),
+            len(incoming_timesteps - old_timesteps),
+            future_action_queue.qsize(),
+        )
+
+        replace_wait_start = time.perf_counter() if diagnostics else 0.0
         with self.action_queue_lock:
+            replace_acquired = time.perf_counter() if diagnostics else 0.0
             self.action_queue = future_action_queue
+        replace_end = time.perf_counter() if diagnostics else 0.0
+
+        if timing is not None:
+            old_queue_timesteps = [action.get_timestep() for action in internal_queue]
+            incoming_all_timesteps = [action.get_timestep() for action in incoming_actions]
+            final_timesteps = [action.get_timestep() for action in future_action_queue.queue]
+            timing.update(
+                aggregate_lock_wait_ms=(
+                    (snapshot_acquired - snapshot_wait_start)
+                    + (replace_acquired - replace_wait_start)
+                )
+                * 1000,
+                old_queue_snapshot_ms=(snapshot_end - snapshot_acquired) * 1000,
+                merge_compute_ms=(merge_compute_end - merge_compute_start) * 1000,
+                queue_rebuild_ms=(queue_rebuild_end - queue_rebuild_start) * 1000,
+                queue_replace_or_update_ms=(replace_end - replace_wait_start) * 1000,
+                aggregate_total_ms=(replace_end - aggregate_start) * 1000,
+                latest_action_timestep=latest_action,
+                old_queue_size=len(old_queue_timesteps),
+                old_queue_first_timestep=(old_queue_timesteps[0] if old_queue_timesteps else None),
+                old_queue_last_timestep=(old_queue_timesteps[-1] if old_queue_timesteps else None),
+                incoming_size=len(incoming_all_timesteps),
+                incoming_first_timestep=(incoming_all_timesteps[0] if incoming_all_timesteps else None),
+                incoming_last_timestep=(incoming_all_timesteps[-1] if incoming_all_timesteps else None),
+                final_queue_size=len(final_timesteps),
+                final_queue_first_timestep=(final_timesteps[0] if final_timesteps else None),
+                final_queue_last_timestep=(final_timesteps[-1] if final_timesteps else None),
+            )
+
+    def _action_boundary_metrics(
+        self,
+        first: torch.Tensor | None,
+        second: torch.Tensor | None,
+    ) -> dict[str, float] | None:
+        """Compute arm-joint deltas without affecting queue or control semantics."""
+        if first is None or second is None:
+            return None
+
+        first_flat = first.detach().flatten()
+        second_flat = second.detach().flatten()
+        if first_flat.shape != second_flat.shape or first_flat.numel() == 0:
+            return None
+
+        action_features = getattr(getattr(self, "robot", None), "action_features", None)
+        feature_names = list(action_features) if action_features is not None else []
+        arm_indices = [
+            index
+            for index, name in enumerate(feature_names)
+            if "_arm_" in name and index < first_flat.numel()
+        ]
+        if arm_indices:
+            first_flat = first_flat[arm_indices]
+            second_flat = second_flat[arm_indices]
+
+        delta = second_flat - first_flat
+        return {
+            "max_abs_delta": delta.abs().max().item(),
+            "l2_delta": torch.linalg.vector_norm(delta).item(),
+        }
+
+    @staticmethod
+    def _format_boundary_metric(metrics: dict[str, float] | None, key: str) -> str:
+        return "n/a" if metrics is None else f"{metrics[key]:.6f}"
 
     def receive_actions(self, verbose: bool = False):
         """Receive actions from the gRPC policy server"""
@@ -484,11 +689,21 @@ class RobotClient:
         while self.running:
             try:
                 # Use StreamActions to get a stream of actions from the server
+                rpc_waited_for_refill, refill_was_sent_at_rpc_start = self._refill_rpc_state()
+                rpc_start = time.perf_counter() if self.config.timing_diagnostics else 0.0
                 actions_chunk = self.stub.GetActions(services_pb2.Empty())
+                rpc_end = time.perf_counter() if self.config.timing_diagnostics else 0.0
                 if len(actions_chunk.data) == 0:
+                    # Only an RPC that started while a refill was outstanding may
+                    # release it. This avoids an older polling RPC racing with a
+                    # newly reserved request.
+                    if rpc_waited_for_refill and refill_was_sent_at_rpc_start:
+                        self._clear_refill_in_flight()
+                        self.must_go.set()
                     continue  # received `Empty` from server, wait for next call
 
                 receive_time = time.time()
+                processing_start = time.perf_counter() if self.config.timing_diagnostics else 0.0
 
                 # Deserialize bytes back into list[TimedAction]
                 deserialize_start = time.perf_counter()
@@ -501,6 +716,9 @@ class RobotClient:
                     self.logger.debug(f"Received actions on device: {received_device}")
 
                 # Move actions to client_device (e.g., for downstream planners that need GPU)
+                device_transfer_start = (
+                    time.perf_counter() if self.config.timing_diagnostics else 0.0
+                )
                 client_device = self.config.client_device
                 if client_device != "cpu":
                     for timed_action in timed_actions:
@@ -509,6 +727,11 @@ class RobotClient:
                     self.logger.debug(f"Converted actions to device: {client_device}")
                 else:
                     self.logger.debug(f"Actions kept on device: {client_device}")
+                device_transfer_ms = (
+                    (time.perf_counter() - device_transfer_start) * 1000
+                    if self.config.timing_diagnostics
+                    else 0.0
+                )
 
                 self.action_chunk_size = max(self.action_chunk_size, len(timed_actions))
 
@@ -528,22 +751,82 @@ class RobotClient:
                     incoming_timesteps = [a.get_timestep() for a in timed_actions]
 
                     first_action_timestep = timed_actions[0].get_timestep()
-                    server_to_client_latency = (receive_time - timed_actions[0].get_timestamp()) * 1000
-
                     self.logger.info(
                         f"Received action chunk for step #{first_action_timestep} | "
                         f"Latest action: #{latest_action} | "
                         f"Incoming actions: {incoming_timesteps[0]}:{incoming_timesteps[-1]} | "
-                        f"Network latency (server->client): {server_to_client_latency:.2f}ms | "
+                        f"Client receive wall time: {receive_time:.6f} | "
+                        f"Action policy wall time: {timed_actions[0].get_timestamp():.6f} | "
                         f"Deserialization time: {deserialize_time * 1000:.2f}ms"
                     )
 
                 # Update action queue
                 start_time = time.perf_counter()
-                self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)
+                aggregate_timing = {} if self.config.timing_diagnostics else None
+                self._aggregate_action_queues(
+                    timed_actions,
+                    self.config.aggregate_fn,
+                    timing=aggregate_timing,
+                )
                 queue_update_time = time.perf_counter() - start_time
+                queue_updated = time.perf_counter() if self.config.timing_diagnostics else 0.0
+
+                refill_was_in_flight = self._clear_refill_in_flight()
 
                 self.must_go.set()  # after receiving actions, next empty queue triggers must-go processing!
+
+                if self.config.timing_diagnostics:
+                    receiver_processing_total_ms = (time.perf_counter() - processing_start) * 1000
+                    incoming_first = aggregate_timing["incoming_first_timestep"]
+                    incoming_last = aggregate_timing["incoming_last_timestep"]
+                    self.logger.info(
+                        "[TIMING][CHUNK_RECEIVED] event_wall_time=%.6f chunk_id=%s "
+                        "chunk_first=%s chunk_last=%s rpc_wait_ms=%.3f deserialize_ms=%.3f "
+                        "device_transfer_ms=%.3f post_receive_processing_ms=%.3f "
+                        "aggregate_wait_for_lock_ms=%.3f aggregate_compute_ms=%.3f "
+                        "old_queue_snapshot_ms=%.3f queue_rebuild_ms=%.3f "
+                        "queue_replace_or_update_ms=%.3f aggregate_total_ms=%.3f "
+                        "receiver_processing_total_ms=%.3f latest_action_timestep=%s "
+                        "old_queue=%s:%s:%s incoming=%s:%s:%s final_queue=%s:%s:%s",
+                        receive_time,
+                        incoming_first,
+                        incoming_first,
+                        incoming_last,
+                        (rpc_end - rpc_start) * 1000,
+                        deserialize_time * 1000,
+                        device_transfer_ms,
+                        (queue_updated - processing_start) * 1000,
+                        aggregate_timing["aggregate_lock_wait_ms"],
+                        aggregate_timing["merge_compute_ms"],
+                        aggregate_timing["old_queue_snapshot_ms"],
+                        aggregate_timing["queue_rebuild_ms"],
+                        aggregate_timing["queue_replace_or_update_ms"],
+                        aggregate_timing["aggregate_total_ms"],
+                        receiver_processing_total_ms,
+                        aggregate_timing["latest_action_timestep"],
+                        aggregate_timing["old_queue_size"],
+                        aggregate_timing["old_queue_first_timestep"],
+                        aggregate_timing["old_queue_last_timestep"],
+                        aggregate_timing["incoming_size"],
+                        incoming_first,
+                        incoming_last,
+                        aggregate_timing["final_queue_size"],
+                        aggregate_timing["final_queue_first_timestep"],
+                        aggregate_timing["final_queue_last_timestep"],
+                    )
+                    with self.latest_action_lock:
+                        latest_action_for_refill = self.latest_action
+                    self.logger.info(
+                        "[TIMING][REFILL_COMPLETE] event_wall_time=%.6f chunk_id=%s "
+                        "latest_action=%s old_queue_size=%s final_queue_size=%s "
+                        "refill_in_flight_before=%s refill_in_flight=False",
+                        time.time(),
+                        incoming_first,
+                        latest_action_for_refill,
+                        aggregate_timing["old_queue_size"],
+                        aggregate_timing["final_queue_size"],
+                        refill_was_in_flight,
+                    )
 
                 if verbose:
                     # Get queue state after changes
@@ -565,7 +848,14 @@ class RobotClient:
                     )
 
             except grpc.RpcError as e:
+                self._clear_refill_in_flight()
+                self.must_go.set()
                 self.logger.error(f"Error receiving actions: {e}")
+
+            except Exception as e:
+                self._clear_refill_in_flight()
+                self.must_go.set()
+                self.logger.error(f"Error processing received actions: {e}")
 
     def actions_available(self):
         """Check if there are actions available in the queue"""
@@ -576,25 +866,116 @@ class RobotClient:
         action = {key: action_tensor[i].item() for i, key in enumerate(self.robot.action_features)}
         return action
 
-    def control_loop_action(self, verbose: bool = False) -> dict[str, Any]:
+    def _emit_action_timing(
+        self,
+        timestep: int,
+        timing: dict[str, Any],
+        action_event_perf: float | None = None,
+        action_event_wall: float | None = None,
+    ) -> None:
+        """Record one scalar action event and warn when its interval exceeds two periods."""
+        if action_event_perf is None:
+            action_event_perf = time.perf_counter()
+        if action_event_wall is None:
+            action_event_wall = time.time()
+        interval_ms = None
+        if self._last_action_perf_time is not None:
+            interval_ms = (action_event_perf - self._last_action_perf_time) * 1000
+
+        timing["action_interval_ms"] = interval_ms
+        timing["timestep"] = timestep
+        timing["event_wall_time"] = action_event_wall
+        self.logger.debug(
+            "[TIMING][ACTION] event_wall_time=%.6f timestep=%s interval_ms=%s "
+            "queue_size_before=%s queue_size_after=%s queue_lock_wait_ms=%.3f "
+            "queue_pop_ms=%.3f action_to_dict_ms=%.3f robot_send_action_ms=%.3f "
+            "latest_action_update_ms=%.3f action_log_write_ms=%.3f "
+            "control_loop_action_total_ms=%.3f",
+            action_event_wall,
+            timestep,
+            f"{interval_ms:.3f}" if interval_ms is not None else "n/a",
+            timing["queue_size_before"],
+            timing["queue_size_after"],
+            timing["queue_lock_wait_ms"],
+            timing["queue_pop_ms"],
+            timing["action_to_dict_ms"],
+            timing["robot_send_action_ms"],
+            timing["latest_action_update_ms"],
+            timing["action_log_write_ms"],
+            timing["control_loop_action_total_ms"],
+        )
+
+        if interval_ms is not None and interval_ms > 2 * self.config.environment_dt * 1000:
+            previous_loop = self._timing_history[-1] if self._timing_history else {}
+            previous_action = previous_loop.get("action", {})
+            previous_observation = previous_loop.get("observation", {})
+            self.logger.warning(
+                "[TIMING][STALL] event_wall_time=%.6f prev_timestep=%s current_timestep=%s "
+                "action_interval_ms=%.3f target_ms=%.3f queue_size_before=%s queue_size_after=%s "
+                "queue_lock_wait_ms=%.3f queue_pop_ms=%.3f robot_send_action_ms=%.3f "
+                "robot_get_observation_ms=%.3f transport_preprocess_ms=%.3f "
+                "serialization_ms=%.3f grpc_send_observation_ms=%.3f "
+                "control_loop_observation_ms=%.3f loop_total_ms=%.3f sleep_budget_ms=%.3f "
+                "current_queue_lock_wait_ms=%.3f current_robot_send_action_ms=%.3f",
+                action_event_wall,
+                self._last_action_timestep,
+                timestep,
+                interval_ms,
+                self.config.environment_dt * 1000,
+                timing["queue_size_before"],
+                timing["queue_size_after"],
+                previous_action.get("queue_lock_wait_ms", 0.0),
+                previous_action.get("queue_pop_ms", 0.0),
+                previous_action.get("robot_send_action_ms", 0.0),
+                previous_observation.get("robot_get_observation_ms", 0.0),
+                previous_observation.get("transport_preprocess_ms", 0.0),
+                previous_observation.get("serialization_ms", 0.0),
+                previous_observation.get("grpc_send_observation_ms", 0.0),
+                previous_observation.get("control_loop_observation_ms", 0.0),
+                previous_loop.get("loop_total_ms", 0.0),
+                previous_loop.get("sleep_budget_ms", 0.0),
+                timing["queue_lock_wait_ms"],
+                timing["robot_send_action_ms"],
+            )
+
+        self._last_action_perf_time = action_event_perf
+        self._last_action_timestep = timestep
+
+    def control_loop_action(
+        self,
+        verbose: bool = False,
+        timing: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Reading and performing actions in local queue"""
 
         # Lock only for queue operations
+        action_start = time.perf_counter() if timing is not None else 0.0
         get_start = time.perf_counter()
         with self.action_queue_lock:
-            self.action_queue_size.append(self.action_queue.qsize())
+            lock_acquired = time.perf_counter() if timing is not None else 0.0
+            queue_size_before = self.action_queue.qsize()
+            self.action_queue_size.append(queue_size_before)
             # Get action from queue
+            pop_start = time.perf_counter() if timing is not None else 0.0
             timed_action = self.action_queue.get_nowait()
+            pop_end = time.perf_counter() if timing is not None else 0.0
             # 2배속 소모를 원한다면...
             # timed_action = self.action_queue.get_nowait() 
         get_end = time.perf_counter() - get_start
 
+        action_to_dict_start = time.perf_counter() if timing is not None else 0.0
         logging_actions = self._action_tensor_to_action_dict(timed_action.get_action())
+        action_to_dict_end = time.perf_counter() if timing is not None else 0.0
 
+        latest_action_update_start = time.perf_counter() if timing is not None else 0.0
         with self.latest_action_lock:
             self.latest_action = timed_action.get_timestep()
+            self.latest_action_tensor = timed_action.get_action()
+        latest_action_update_end = time.perf_counter() if timing is not None else 0.0
 
+        robot_send_start = time.perf_counter() if timing is not None else 0.0
         _performed_action = self.robot.send_action(logging_actions)
+        robot_send_end = time.perf_counter() if timing is not None else 0.0
 
         # Loggggging action to file
 
@@ -605,8 +986,32 @@ class RobotClient:
             "action": logging_actions,
         }
 
+        action_log_start = time.perf_counter() if timing is not None else 0.0
         with open(FINAL_ACTION_LOG, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")       
+        action_log_end = time.perf_counter() if timing is not None else 0.0
+
+        if timing is not None:
+            timing.update(
+                queue_size_before=queue_size_before,
+                queue_size_after=max(0, queue_size_before - 1),
+                queue_lock_wait_ms=(lock_acquired - get_start) * 1000,
+                queue_pop_ms=(pop_end - pop_start) * 1000,
+                action_to_dict_ms=(action_to_dict_end - action_to_dict_start) * 1000,
+                latest_action_update_ms=(
+                    latest_action_update_end - latest_action_update_start
+                )
+                * 1000,
+                robot_send_action_ms=(robot_send_end - robot_send_start) * 1000,
+                action_log_write_ms=(action_log_end - action_log_start) * 1000,
+                control_loop_action_total_ms=(action_log_end - action_start) * 1000,
+            )
+            self._emit_action_timing(
+                timed_action.get_timestep(),
+                timing,
+                action_event_perf=robot_send_end,
+                action_event_wall=record["wall_time"],
+            )
 
 
 
@@ -627,16 +1032,43 @@ class RobotClient:
         return _performed_action
 
     def _ready_to_send_observation(self):
-        """Flags when the client is ready to send an observation"""
+        """Reserve one gRPC refill when the queue reaches its threshold."""
         with self.action_queue_lock:
-            return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
+            queue_size = self.action_queue.qsize()
+            if not self.uses_grpc_backend:
+                return queue_size / self.action_chunk_size <= self._chunk_size_threshold
 
-    def control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
+            if self._refill_in_flight:
+                return False
+
+            queue_ratio = (
+                queue_size / self.action_chunk_size if self.action_chunk_size > 0 else 0.0
+            )
+            if queue_ratio > self._chunk_size_threshold:
+                return False
+
+            # Reserve before observation capture so the next control iteration
+            # cannot create a duplicate request. Failed sends roll this back.
+            self._refill_in_flight = True
+            self._refill_request_sent = False
+            self._refill_request_queue_size = queue_size
+            self._refill_request_queue_ratio = queue_ratio
+            return True
+
+    def control_loop_observation(
+        self,
+        task: str,
+        verbose: bool = False,
+        timing: dict[str, Any] | None = None,
+        force_refill: bool = False,
+    ) -> RawObservation:
         try:
             # Get serialized observation bytes from the function
             start_time = time.perf_counter()
 
+            robot_observation_start = time.perf_counter() if timing is not None else 0.0
             raw_observation: RawObservation = self.robot.get_observation()
+            robot_observation_end = time.perf_counter() if timing is not None else 0.0
             raw_observation["task"] = task
 
             with self.latest_action_lock:
@@ -652,13 +1084,74 @@ class RobotClient:
 
             # If there are no actions left in the queue, the observation must go through processing!
             with self.action_queue_lock:
-                observation.must_go = self.must_go.is_set() and self.action_queue.empty()
+                observation.must_go = force_refill or (
+                    self.must_go.is_set() and self.action_queue.empty()
+                )
                 current_queue_size = self.action_queue.qsize()
+                refill_queue_size = self._refill_request_queue_size
+                refill_queue_ratio = self._refill_request_queue_ratio
 
-            _ = self.send_observation(observation)
+            if timing is not None:
+                timing["robot_get_observation_ms"] = (
+                    robot_observation_end - robot_observation_start
+                ) * 1000
+
+            observation_sent = self.send_observation(observation, timing=timing)
+            observation_end = time.perf_counter() if timing is not None else 0.0
+
+            if force_refill:
+                if observation_sent:
+                    with self.action_queue_lock:
+                        # A very fast receiver may already have completed and
+                        # cleared this request; never resurrect that state.
+                        if self._refill_in_flight:
+                            self._refill_request_sent = True
+                else:
+                    self._clear_refill_in_flight()
+                    self.must_go.set()
+
+            if (
+                observation_sent
+                and force_refill
+                and self.config.timing_diagnostics
+            ):
+                self.logger.info(
+                    "[TIMING][REFILL_REQUEST] event_wall_time=%.6f timestep=%s "
+                    "queue_size=%s queue_ratio=%.3f refill_in_flight_before=False must_go=%s",
+                    time.time(),
+                    observation.get_timestep(),
+                    refill_queue_size if refill_queue_size is not None else current_queue_size,
+                    refill_queue_ratio if refill_queue_ratio is not None else 0.0,
+                    observation.must_go,
+                )
+
+            if timing is not None:
+                timing["control_loop_observation_ms"] = (
+                    observation_end - start_time
+                ) * 1000
+                self.logger.debug(
+                    "[TIMING][OBSERVATION] event_wall_time=%.6f timestep=%s must_go=%s "
+                    "queue_size=%s robot_get_observation_ms=%.3f transport_preprocess_ms=%.3f "
+                    "resize_ms=%.3f jpeg_encode_ms=%.3f serialization_ms=%.3f "
+                    "grpc_send_observation_ms=%.3f transport_bytes=%s serialized_bytes=%s "
+                    "control_loop_observation_ms=%.3f",
+                    time.time(),
+                    observation.get_timestep(),
+                    observation.must_go,
+                    current_queue_size,
+                    timing["robot_get_observation_ms"],
+                    timing.get("transport_preprocess_ms", 0.0),
+                    timing.get("resize_ms", 0.0),
+                    timing.get("jpeg_encode_ms", 0.0),
+                    timing.get("serialization_ms", 0.0),
+                    timing.get("grpc_send_observation_ms", 0.0),
+                    timing.get("transport_bytes", 0),
+                    timing.get("serialized_bytes", 0),
+                    timing["control_loop_observation_ms"],
+                )
 
             self.logger.debug(f"QUEUE SIZE: {current_queue_size} (Must go: {observation.must_go})")
-            if observation.must_go:
+            if observation.must_go and observation_sent:
                 # must-go event will be set again after receiving actions
                 self.must_go.clear()
 
@@ -679,6 +1172,9 @@ class RobotClient:
             return raw_observation
 
         except Exception as e:
+            if force_refill:
+                self._clear_refill_in_flight()
+                self.must_go.set()
             self.logger.error(f"Error in observation sender: {e}")
 
 
@@ -925,14 +1421,40 @@ class RobotClient:
 
         while self.running:
             control_loop_start = time.perf_counter()
+            loop_timing = {} if self.config.timing_diagnostics else None
             """Control loop: (1) Performing actions, when available"""
-            if self.actions_available():
-                _performed_action = self.control_loop_action(verbose)
+            actions_available_start = (
+                time.perf_counter() if self.config.timing_diagnostics else 0.0
+            )
+            has_actions = self.actions_available()
+            if loop_timing is not None:
+                loop_timing["actions_available_ms"] = (
+                    time.perf_counter() - actions_available_start
+                ) * 1000
+            if has_actions:
+                action_timing = {} if loop_timing is not None else None
+                _performed_action = self.control_loop_action(verbose, timing=action_timing)
+                if loop_timing is not None:
+                    loop_timing["action"] = action_timing
 
             """Control loop: (2) Streaming observations to the remote policy server"""
-            if self._ready_to_send_observation():
+            ready_start = time.perf_counter() if self.config.timing_diagnostics else 0.0
+            ready_to_send = self._ready_to_send_observation()
+            if loop_timing is not None:
+                loop_timing["ready_to_send_observation_ms"] = (
+                    time.perf_counter() - ready_start
+                ) * 1000
+            if ready_to_send:
                 if self.uses_grpc_backend:
-                    _captured_observation = self.control_loop_observation(task, verbose)
+                    observation_timing = {} if loop_timing is not None else None
+                    _captured_observation = self.control_loop_observation(
+                        task,
+                        verbose,
+                        timing=observation_timing,
+                        force_refill=True,
+                    )
+                    if loop_timing is not None:
+                        loop_timing["observation"] = observation_timing
 
                 elif self.uses_remote_zmq_backend:
                     _captured_observation = self.control_loop_remote_observation(task, verbose)
@@ -941,9 +1463,43 @@ class RobotClient:
 
                 
 
-            self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
+            loop_elapsed = time.perf_counter() - control_loop_start
+            if loop_timing is not None:
+                loop_timing["control_loop_action_ms"] = loop_timing.get("action", {}).get(
+                    "control_loop_action_total_ms", 0.0
+                )
+                loop_timing["control_loop_observation_ms"] = loop_timing.get(
+                    "observation", {}
+                ).get("control_loop_observation_ms", 0.0)
+                loop_timing["loop_total_ms"] = loop_elapsed * 1000
+                loop_timing["sleep_budget_ms"] = max(
+                    0, self.config.environment_dt - loop_elapsed
+                ) * 1000
+                self.logger.debug(
+                    "[TIMING][CONTROL_LOOP] event_wall_time=%.6f loop_total_ms=%.3f "
+                    "actions_available_ms=%.3f control_loop_action_ms=%.3f "
+                    "ready_to_send_observation_ms=%.3f control_loop_observation_ms=%.3f "
+                    "sleep_budget_ms=%.3f",
+                    time.time(),
+                    loop_timing["loop_total_ms"],
+                    loop_timing["actions_available_ms"],
+                    loop_timing["control_loop_action_ms"],
+                    loop_timing["ready_to_send_observation_ms"],
+                    loop_timing["control_loop_observation_ms"],
+                    loop_timing["sleep_budget_ms"],
+                )
+                self._timing_history.append(loop_timing)
+
+            self.logger.debug(f"Control loop (ms): {loop_elapsed * 1000:.2f}")
             # Dynamically adjust sleep time to maintain the desired control frequency
-            time.sleep(max(0, self.config.environment_dt - (time.perf_counter() - control_loop_start)))
+            sleep_budget = max(
+                0, self.config.environment_dt - (time.perf_counter() - control_loop_start)
+            )
+            if loop_timing is not None:
+                # Keep the snapshot used by a later STALL summary aligned with the
+                # actual sleep call, including diagnostic logging overhead.
+                loop_timing["sleep_budget_ms"] = sleep_budget * 1000
+            time.sleep(sleep_budget)
 
         return _captured_observation, _performed_action
 

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -28,12 +29,39 @@ from .constants import (
 )
 from .image_transport import validate_image_resize_scale
 
+
+def cosine_ramp_alpha(overlap_index: int, overlap_count: int) -> float:
+    """Return the old-to-new blend weight for one position in an overlap."""
+    if overlap_count <= 0:
+        raise ValueError(f"overlap_count must be positive, got {overlap_count}")
+    if overlap_index < 0 or overlap_index >= overlap_count:
+        raise ValueError(
+            f"overlap_index must be in [0, {overlap_count}), got {overlap_index}"
+        )
+
+    s = (overlap_index + 1) / (overlap_count + 1)
+    return 0.5 * (1.0 - math.cos(math.pi * s))
+
+
+def cosine_ramp(
+    old: torch.Tensor,
+    new: torch.Tensor,
+    *,
+    overlap_index: int = 0,
+    overlap_count: int = 1,
+) -> torch.Tensor:
+    """Blend one overlap action using its position in the complete overlap."""
+    alpha = cosine_ramp_alpha(overlap_index, overlap_count)
+    return (1.0 - alpha) * old + alpha * new
+
+
 # Aggregate function registry for CLI usage
 AGGREGATE_FUNCTIONS = {
     "weighted_average": lambda old, new: 0.3 * old + 0.7 * new,
     "latest_only": lambda old, new: new,
     "average": lambda old, new: 0.5 * old + 0.5 * new,
     "conservative": lambda old, new: 0.7 * old + 0.3 * new,
+    "cosine_ramp": cosine_ramp,
 }
 
 
@@ -65,6 +93,15 @@ class PolicyServerConfig:
 
     obs_queue_timeout: float = field(
         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
+    )
+
+    # Optional, one-shot offline diagnostic capture. Keeping this disabled has
+    # no effect on the inference path.
+    dump_frozen_policy_batch: str | None = field(
+        default=None,
+        metadata={
+            "help": "Save the first policy-ready (post-preprocessor) batch for offline diagnostics"
+        },
     )
 
     def __post_init__(self):
@@ -189,6 +226,10 @@ class RobotClientConfig:
     debug_visualize_queue_size: bool = field(
         default=False, metadata={"help": "Visualize the action queue size"}
     )
+    timing_diagnostics: bool = field(
+        default=False,
+        metadata={"help": "Enable low-overhead control-loop timing diagnostics"},
+    )
 
     @property
     def environment_dt(self) -> float:
@@ -284,5 +325,6 @@ class RobotClientConfig:
             "right_wrist_camera_key": self.right_wrist_camera_key,
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
+            "timing_diagnostics": self.timing_diagnostics,
             "aggregate_fn_name": self.aggregate_fn_name,
         }

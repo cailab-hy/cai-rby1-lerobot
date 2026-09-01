@@ -89,3 +89,33 @@ server option is needed:
 ```bash
 lerobot-policy-server --host=0.0.0.0 --port=8080 --fps=15
 ```
+
+## Frozen SmolVLA noise diagnostic
+
+The policy server can save the first batch after transport decoding, normal
+observation preparation, and the complete policy preprocessor. This is a
+one-shot diagnostic capture; inference continues normally after the save.
+
+```bash
+lerobot-policy-server \
+  --host=0.0.0.0 \
+  --port=8080 \
+  --fps=15 \
+  --dump_frozen_policy_batch=/home/cai/frozen_smolvla_batch.pt
+```
+
+After stopping the robot rollout, run the robot-free analysis from this
+package directory:
+
+```bash
+python tools/analyze_smolvla_frozen_noise.py \
+  --checkpoint=/path/to/checkpoints/020000/pretrained_model \
+  --frozen_batch=/home/cai/frozen_smolvla_batch.pt \
+  --device=cuda \
+  --num_runs=30 \
+  --output_dir=outputs/frozen_noise_analysis
+```
+
+The default action grouping matches RB-Y1 checkpoint order: right arm `0:7`,
+left arm `7:14`, and grippers `14:16`. Use the corresponding `--*_indices`
+options if analyzing a checkpoint with a different layout.

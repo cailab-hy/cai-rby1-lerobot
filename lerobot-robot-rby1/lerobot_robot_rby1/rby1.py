@@ -141,6 +141,7 @@ class Rby1(Robot):
         self._ready_right: np.ndarray = READY_RIGHT
         self._ready_left: np.ndarray = READY_LEFT
         self._ready_head: np.ndarray = READY_HEAD
+        self._timing_diagnostics: bool = False
 
     # ------------------------------------------------------------------ #
     #  Properties                                                          #
@@ -535,6 +536,9 @@ class Rby1(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
+        diagnostics = self._timing_diagnostics
+        observation_start = time.perf_counter() if diagnostics else 0.0
+        robot_state_start = time.perf_counter() if diagnostics else 0.0
         state = self._robot.get_state()
         model = self._model
         obs: dict[str, Any] = {}
@@ -548,19 +552,37 @@ class Rby1(Robot):
 
         # End-effector poses (EE mode): forward kinematics of the enabled groups.
         self._read_ee_observation(obs, state)
+        robot_state_end = time.perf_counter() if diagnostics else 0.0
 
         # Grippers. Dataset convention is 1.0 = open, 0.0 = closed; Rby1Gripper
         # reports 0 = open, 1 = closed, so both sides are flipped here.
+        gripper_start = time.perf_counter() if diagnostics else 0.0
         if self._config.use_gripper and self._gripper is not None:
             gripper_pos = self._gripper.get_positions()  # [right, left], 0=open 1=closed
             if self._config.use_right_arm:
                 obs["right_gripper_0"] = 1.0 - float(gripper_pos[0])
             if self._config.use_left_arm:
                 obs["left_gripper_0"] = 1.0 - float(gripper_pos[1])
+        gripper_end = time.perf_counter() if diagnostics else 0.0
 
         # Cameras.
+        camera_timings = {} if diagnostics else None
         for cam_key, cam in self.cameras.items():
+            camera_start = time.perf_counter() if diagnostics else 0.0
             obs[cam_key] = cam.async_read()
+            if camera_timings is not None:
+                camera_timings[cam_key] = (time.perf_counter() - camera_start) * 1000
+
+        if diagnostics:
+            logger.debug(
+                "[TIMING][RBY1_OBSERVATION] event_wall_time=%.6f robot_state_ms=%.3f "
+                "gripper_read_ms=%.3f camera_read_ms=%s get_observation_total_ms=%.3f",
+                time.time(),
+                (robot_state_end - robot_state_start) * 1000,
+                (gripper_end - gripper_start) * 1000,
+                camera_timings,
+                (time.perf_counter() - observation_start) * 1000,
+            )
 
         return obs
 

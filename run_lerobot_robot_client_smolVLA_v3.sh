@@ -18,22 +18,22 @@ lerobot-robot-client \
       "type": "intelrealsense",
       "serial_number_or_name": "260322274450",
       "fps": 15,
-      "width": 424,
-      "height": 240
+      "width": 640,
+      "height": 480
     },
     "camera2": {
       "type": "intelrealsense",
       "serial_number_or_name": "260322274992",
       "fps": 15,
-      "width": 424,
-      "height": 240
+      "width": 640,
+      "height": 480
     },
     "camera3": {
       "type": "intelrealsense",
       "serial_number_or_name": "260322276006",
       "fps": 15,
-      "width": 424,
-      "height": 240
+      "width": 640,
+      "height": 480
     }
   }' \
   --policy_type=smolvla \
@@ -42,9 +42,12 @@ lerobot-robot-client \
   --client_device=cpu \
   --actions_per_chunk=50 \
   --chunk_size_threshold=0.5 \
-  --aggregate_fn_name=weighted_average \
+  --aggregate_fn_name=cosine_ramp \
   --task="Pick up the bowl and place it in the box." \
-  --fps=15
+  --fps=15 \
+  --image_resize_scale=1.0 \
+  --jpeg_compression=true \
+  --timing_diagnostics=true
 
 # Pick up the bowl and place it in the box.
 # Pick up the cup and place it in the box.
