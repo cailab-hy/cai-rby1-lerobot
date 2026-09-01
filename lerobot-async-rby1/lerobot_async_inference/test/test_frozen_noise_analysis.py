@@ -10,6 +10,7 @@ from lerobot_async_inference.configs import PolicyServerConfig
 from lerobot_async_inference.frozen_noise_analysis import (
     analyze_actions,
     clone_to_cpu,
+    diagnose_questions,
     execute_condition,
     nested_checksum,
 )
@@ -138,6 +139,69 @@ def test_server_dump_is_one_shot_and_cpu_cloned(tmp_path) -> None:
     assert server._frozen_batch_dumped is True
 
 
+def _diagnostic_metrics(
+    *, mean_std: float, max_std: float, delta_p95: float, second_delta_p95: float
+) -> dict[tuple[str, str], float]:
+    return {
+        ("all", "across_run_std_mean"): mean_std,
+        ("all", "across_run_std_max"): max_std,
+        ("arms", "within_chunk_delta_p95"): delta_p95,
+        ("arms", "within_chunk_second_delta_p95"): second_delta_p95,
+    }
+
+
+def test_explicit_q1_q2_q3_and_primary_classifications() -> None:
+    fixed_smooth = _diagnostic_metrics(
+        mean_std=0.0, max_std=0.0, delta_p95=0.001, second_delta_p95=0.001
+    )
+    random_variable = _diagnostic_metrics(
+        mean_std=0.1, max_std=0.2, delta_p95=0.01, second_delta_p95=0.01
+    )
+    case_a = diagnose_questions(
+        random_variable,
+        fixed_smooth,
+        determinism_atol=1e-6,
+        variance_ratio=10.0,
+        rough_delta_threshold=0.005,
+        rough_second_delta_threshold=0.005,
+    )
+    assert case_a["q1"]["answer"] == "YES"
+    assert case_a["q2"]["answer"] == "NO"
+    assert case_a["q3"]["answer"] == "NO"
+    assert case_a["primary_classification"] == "A"
+
+    fixed_rough = _diagnostic_metrics(
+        mean_std=0.0, max_std=0.0, delta_p95=0.02, second_delta_p95=0.03
+    )
+    case_b = diagnose_questions(
+        random_variable,
+        fixed_rough,
+        determinism_atol=1e-6,
+        variance_ratio=10.0,
+        rough_delta_threshold=0.005,
+        rough_second_delta_threshold=0.005,
+    )
+    assert case_b["q1"]["answer"] == "YES"
+    assert case_b["q2"]["answer"] == "YES"
+    assert case_b["primary_classification"] == "B"
+    assert case_b["secondary_findings"]
+
+    fixed_nondeterministic = _diagnostic_metrics(
+        mean_std=1e-4, max_std=1e-3, delta_p95=0.001, second_delta_p95=0.001
+    )
+    case_c = diagnose_questions(
+        random_variable,
+        fixed_nondeterministic,
+        determinism_atol=1e-6,
+        variance_ratio=10.0,
+        rough_delta_threshold=0.005,
+        rough_second_delta_threshold=0.005,
+    )
+    assert case_c["q1"]["answer"] == "INCONCLUSIVE"
+    assert case_c["q3"]["answer"] == "YES"
+    assert case_c["primary_classification"] == "C"
+
+
 def _run_server_dump_test() -> None:
     with tempfile.TemporaryDirectory() as directory:
         test_server_dump_is_one_shot_and_cpu_cloned(Path(directory))
@@ -150,6 +214,7 @@ def load_tests(loader, tests, pattern):  # noqa: ARG001
         test_recursive_clone_preserves_source_and_tensor_values,
         test_random_and_fixed_conditions_reset_clone_and_stack,
         test_delta_second_delta_and_sign_flip_metrics,
+        test_explicit_q1_q2_q3_and_primary_classifications,
         _run_server_dump_test,
     ):
         suite.addTest(unittest.FunctionTestCase(function))

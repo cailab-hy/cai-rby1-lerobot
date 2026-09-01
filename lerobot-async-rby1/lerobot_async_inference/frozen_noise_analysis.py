@@ -357,7 +357,7 @@ def _print_metric_section(
             )
 
 
-def _interpret(
+def diagnose_questions(
     random_metrics: dict[tuple[str, str], float],
     fixed_metrics: dict[tuple[str, str], float],
     *,
@@ -365,42 +365,134 @@ def _interpret(
     variance_ratio: float,
     rough_delta_threshold: float,
     rough_second_delta_threshold: float,
-) -> list[str]:
-    conclusions: list[str] = []
+) -> dict[str, Any]:
+    """Answer Q1-Q3 and select a primary A/B/C diagnostic classification.
+
+    C has highest priority because a nondeterministic fixed condition invalidates
+    clean attribution to either sampling noise or one deterministic trajectory.
+    If A and B are both observed, B is primary for the reported within-chunk
+    jitter, while A is retained as a secondary chunk-to-chunk finding.
+    """
     random_mean = random_metrics[("all", "across_run_std_mean")]
     fixed_mean = fixed_metrics[("all", "across_run_std_mean")]
     fixed_max = fixed_metrics[("all", "across_run_std_max")]
+    fixed_delta_p95 = fixed_metrics[("arms", "within_chunk_delta_p95")]
+    fixed_second_delta_p95 = fixed_metrics[
+        ("arms", "within_chunk_second_delta_p95")
+    ]
+    std_ratio = random_mean / max(fixed_mean, torch.finfo(torch.float64).eps)
 
-    if fixed_max > determinism_atol:
-        conclusions.append(
-            "Output is changing even with identical observation and identical noise. "
-            "Check hidden policy state, batch mutation, dropout/training mode, CUDA "
-            "nondeterminism, or preprocessing state."
+    q3_fixed_changes = fixed_max > determinism_atol
+    q1_random_major = (
+        not q3_fixed_changes
+        and random_mean > determinism_atol
+        and std_ratio > variance_ratio
+    )
+    q2_fixed_rough = (
+        fixed_delta_p95 > rough_delta_threshold
+        or fixed_second_delta_p95 > rough_second_delta_threshold
+    )
+
+    if q3_fixed_changes:
+        q1_answer = "INCONCLUSIVE"
+        primary = "C"
+        primary_text = (
+            "Fixed observation + fixed noise is not repeatable; investigate policy state, "
+            "batch/preprocessing mutation, training mode, or CUDA nondeterminism first."
         )
+        secondary: list[str] = []
     else:
-        if random_mean > determinism_atol and random_mean > variance_ratio * max(
-            fixed_mean, torch.finfo(torch.float64).eps
-        ):
-            conclusions.append(
-                "Flow-matching random sampling is a major source of chunk-to-chunk variability."
+        q1_answer = "YES" if q1_random_major else "NO"
+        secondary = []
+        if q2_fixed_rough:
+            primary = "B"
+            primary_text = (
+                "The fixed-noise trajectory remains temporally rough; prioritize dataset "
+                "trajectory quality, training, and temporal regularization."
             )
-        delta_p95 = fixed_metrics[("arms", "within_chunk_delta_p95")]
-        second_p95 = fixed_metrics[("arms", "within_chunk_second_delta_p95")]
-        if (
-            delta_p95 > rough_delta_threshold
-            or second_p95 > rough_second_delta_threshold
-        ):
-            conclusions.append(
-                "The generated trajectory itself is temporally rough even with deterministic "
-                "noise. This points toward model/dataset trajectory quality rather than sampling "
-                "stochasticity for the within-chunk component."
+            if q1_random_major:
+                secondary.append(
+                    "A: Random sampling also contributes substantial chunk-to-chunk variability."
+                )
+        elif q1_random_major:
+            primary = "A"
+            primary_text = (
+                "Random flow-matching sampling is the detected source; consider deterministic "
+                "noise or sampling averaging."
             )
-    if not conclusions:
-        conclusions.append(
-            "No configured diagnostic heuristic fired; inspect the raw metrics and choose "
-            "domain-specific thresholds for this robot and control rate."
+        else:
+            primary = "INCONCLUSIVE"
+            primary_text = (
+                "Neither A, B, nor C crossed the configured thresholds; inspect raw metrics and "
+                "set robot/control-rate-specific thresholds."
+            )
+
+    return {
+        "q1": {
+            "answer": q1_answer,
+            "question": "Does random flow noise substantially change chunks for one observation?",
+            "evidence": {
+                "random_across_run_mean_std": random_mean,
+                "fixed_across_run_mean_std": fixed_mean,
+                "random_to_fixed_std_ratio": std_ratio,
+                "required_ratio": variance_ratio,
+            },
+        },
+        "q2": {
+            "answer": "YES" if q2_fixed_rough else "NO",
+            "question": "Is the fixed-noise trajectory temporally rough within a chunk?",
+            "evidence": {
+                "fixed_arm_delta_p95": fixed_delta_p95,
+                "delta_threshold": rough_delta_threshold,
+                "fixed_arm_second_delta_p95": fixed_second_delta_p95,
+                "second_delta_threshold": rough_second_delta_threshold,
+            },
+        },
+        "q3": {
+            "answer": "YES" if q3_fixed_changes else "NO",
+            "question": "Does output change with fixed observation and fixed noise?",
+            "evidence": {
+                "fixed_across_run_max_std": fixed_max,
+                "determinism_atol": determinism_atol,
+            },
+        },
+        "primary_classification": primary,
+        "primary_interpretation": primary_text,
+        "secondary_findings": secondary,
+    }
+
+
+def _diagnosis_csv_rows(diagnosis: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for question_key in ("q1", "q2", "q3"):
+        question = diagnosis[question_key]
+        for metric, value in question["evidence"].items():
+            rows.append(
+                {
+                    "question": question_key.upper(),
+                    "answer": question["answer"],
+                    "metric": metric,
+                    "value": value,
+                }
+            )
+    rows.append(
+        {
+            "question": "PRIMARY",
+            "answer": diagnosis["primary_classification"],
+            "metric": "interpretation",
+            "value": diagnosis["primary_interpretation"],
+        }
+    )
+    for index, finding in enumerate(diagnosis["secondary_findings"], start=1):
+        rows.append(
+            {
+                "question": "SECONDARY",
+                "answer": str(index),
+                "metric": "finding",
+                "value": finding,
+            }
         )
-    return conclusions
+    return rows
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -592,7 +684,7 @@ def main(argv: list[str] | None = None) -> int:
             f"{row['FIXED_NOISE']:14.8g}"
         )
 
-    conclusions = _interpret(
+    diagnosis = diagnose_questions(
         random_lookup,
         fixed_lookup,
         determinism_atol=args.determinism_atol,
@@ -600,9 +692,23 @@ def main(argv: list[str] | None = None) -> int:
         rough_delta_threshold=args.rough_delta_threshold,
         rough_second_delta_threshold=args.rough_second_delta_threshold,
     )
-    print("\nCONCLUSION (configured heuristics; verify against raw metrics):")
-    for conclusion in conclusions:
-        print(f"  - {conclusion}")
+    print("\nQ1-Q3 DIAGNOSTIC ANSWERS (configured heuristics):")
+    for question_key in ("q1", "q2", "q3"):
+        question = diagnosis[question_key]
+        evidence = ", ".join(
+            f"{name}={value:.8g}" if isinstance(value, float) else f"{name}={value}"
+            for name, value in question["evidence"].items()
+        )
+        print(
+            f"  {question_key.upper()}: {question['answer']} | "
+            f"{question['question']} | {evidence}"
+        )
+    print(
+        f"\nPRIMARY_CLASSIFICATION: {diagnosis['primary_classification']}\n"
+        f"  {diagnosis['primary_interpretation']}"
+    )
+    for finding in diagnosis["secondary_findings"]:
+        print(f"  Secondary: {finding}")
 
     for condition, results in conditions.items():
         stem = condition.lower().replace("_noise", "")
@@ -635,6 +741,11 @@ def main(argv: list[str] | None = None) -> int:
         comparison_rows,
         ["metric", "RANDOM_NOISE", "FIXED_NOISE"],
     )
+    _write_csv(
+        output_dir / "diagnostic_answers.csv",
+        _diagnosis_csv_rows(diagnosis),
+        ["question", "answer", "metric", "value"],
+    )
 
     checksum_after = nested_checksum(frozen_batch)
     metadata = {
@@ -659,7 +770,7 @@ def main(argv: list[str] | None = None) -> int:
         "latencies_s": {
             condition: result.latencies_s for condition, result in conditions.items()
         },
-        "conclusions": conclusions,
+        "diagnosis": diagnosis,
     }
     with (output_dir / "summary.json").open("w") as stream:
         json.dump(metadata, stream, indent=2)
