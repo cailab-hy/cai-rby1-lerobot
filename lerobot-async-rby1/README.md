@@ -119,3 +119,8 @@ python tools/analyze_smolvla_frozen_noise.py \
 The default action grouping matches RB-Y1 checkpoint order: right arm `0:7`,
 left arm `7:14`, and grippers `14:16`. Use the corresponding `--*_indices`
 options if analyzing a checkpoint with a different layout.
+
+The terminal and `diagnostic_answers.csv` explicitly answer Q1/Q2/Q3 and emit
+one primary classification: C takes priority when fixed-noise repeatability is
+broken; otherwise B is primary when fixed-noise trajectories remain rough,
+then A when only random-noise variability is significant.

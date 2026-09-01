@@ -115,6 +115,8 @@ class TrialResults:
     raw_actions: torch.Tensor
     robot_actions: torch.Tensor
     latencies_s: list[float]
+    frozen_checksum: str
+    noise_checksum: str | None
 
 
 def execute_condition(
@@ -125,6 +127,7 @@ def execute_condition(
     device: torch.device,
     num_runs: int,
     fixed_noise: torch.Tensor | None,
+    warmup_runs: int = 0,
 ) -> TrialResults:
     """Run RANDOM (``fixed_noise=None``) or a fixed external-noise condition."""
     raw_runs: list[torch.Tensor] = []
@@ -134,7 +137,7 @@ def execute_condition(
     noise_checksum = nested_checksum(fixed_noise) if fixed_noise is not None else None
 
     policy.eval()
-    for _ in range(num_runs):
+    for run in range(warmup_runs + num_runs):
         policy.reset()
         batch_i = clone_to_device(frozen_batch, device)
         if nested_checksum(batch_i) != frozen_checksum:
@@ -146,7 +149,14 @@ def execute_condition(
         with torch.inference_mode():
             raw = policy.predict_action_chunk(batch_i, noise=noise_i)
         _synchronize(device)
-        latencies.append(time.perf_counter() - started)
+        elapsed = time.perf_counter() - started
+
+        if fixed_noise is not None and nested_checksum(fixed_noise) != noise_checksum:
+            raise RuntimeError("The shared fixed-noise tensor was mutated during a trial")
+        if run < warmup_runs:
+            continue
+
+        latencies.append(elapsed)
 
         if raw.ndim != 3:
             raise ValueError(f"Policy returned action shape {tuple(raw.shape)}; expected (B, T, A)")
@@ -159,27 +169,31 @@ def execute_condition(
         raw_runs.append(raw_cpu)
         robot_runs.append(robot.squeeze(0).detach().clone().cpu())
 
-        if fixed_noise is not None and nested_checksum(fixed_noise) != noise_checksum:
-            raise RuntimeError("The shared fixed-noise tensor was mutated during a trial")
-
     if nested_checksum(frozen_batch) != frozen_checksum:
         raise RuntimeError("The source frozen batch was mutated during the experiment")
     return TrialResults(
         raw_actions=torch.stack(raw_runs),
         robot_actions=torch.stack(robot_runs),
         latencies_s=latencies,
+        frozen_checksum=frozen_checksum,
+        noise_checksum=noise_checksum,
     )
 
 
 def _summary(values: torch.Tensor) -> dict[str, float]:
     flat = values.detach().to(torch.float64).flatten()
     if flat.numel() == 0:
-        return {key: math.nan for key in ("mean", "median", "p95", "p99", "max")}
+        return {
+            key: math.nan
+            for key in ("mean", "median", "p90", "p95", "p99", "min", "max")
+        }
     return {
         "mean": flat.mean().item(),
         "median": flat.median().item(),
+        "p90": torch.quantile(flat, 0.90).item(),
         "p95": torch.quantile(flat, 0.95).item(),
         "p99": torch.quantile(flat, 0.99).item(),
+        "min": flat.min().item(),
         "max": flat.max().item(),
     }
 
@@ -284,6 +298,7 @@ def analyze_actions(
                 "run": run,
                 "rmse_vs_run0": difference.square().mean().sqrt().item(),
                 "l2_vs_run0": torch.linalg.vector_norm(difference).item(),
+                "mean_abs_vs_run0": difference.abs().mean().item(),
                 "max_abs_vs_run0": difference.abs().max().item(),
             }
         )
@@ -495,6 +510,439 @@ def _diagnosis_csv_rows(diagnosis: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def _parse_num_steps_list(spec: str) -> list[int]:
+    values = [int(part.strip()) for part in spec.split(",") if part.strip()]
+    if not values:
+        raise ValueError("--num-steps-list must contain at least one integer")
+    if any(value <= 0 for value in values):
+        raise ValueError("Every --num-steps-list value must be positive")
+    if len(values) != len(set(values)):
+        raise ValueError("--num-steps-list values must be unique")
+    return values
+
+
+def _is_torch_compiled(callable_object: Any) -> bool:
+    """Best-effort runtime check for a callable returned by ``torch.compile``."""
+    return hasattr(callable_object, "_torchdynamo_orig_callable")
+
+
+def _load_fixed_noise(
+    path: Path,
+    *,
+    expected_shape: tuple[int, int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    saved = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(saved, dict):
+        for key in ("fixed_noise", "noise"):
+            if isinstance(saved.get(key), torch.Tensor):
+                saved = saved[key]
+                break
+    if not isinstance(saved, torch.Tensor):
+        raise TypeError(
+            f"Fixed-noise file must contain a tensor (or fixed_noise/noise key), got {type(saved).__name__}"
+        )
+    if tuple(saved.shape) != expected_shape:
+        raise ValueError(
+            f"Fixed noise shape {tuple(saved.shape)} does not match expected {expected_shape}"
+        )
+    if not saved.is_floating_point():
+        raise TypeError(f"Fixed noise must be floating point, got {saved.dtype}")
+    return saved.detach().clone().to(device)
+
+
+def _num_steps_interpretation(
+    step_values: list[int], lookups: dict[int, dict[tuple[str, str], float]]
+) -> dict[str, Any]:
+    """Return a deliberately conservative, explicitly heuristic interpretation."""
+    ordered = sorted(step_values)
+    if len(ordered) < 2:
+        return {
+            "classification": "INSUFFICIENT_CONDITIONS",
+            "text": "At least two num_steps conditions are needed to assess a trend.",
+        }
+
+    second_p95 = [
+        lookups[step][("arms", "within_chunk_second_delta_p95")] for step in ordered
+    ]
+    delta_p95 = [lookups[step][("arms", "within_chunk_delta_p95")] for step in ordered]
+    oscillation = [
+        torch.tensor(
+            [
+                lookups[step][("right_arm", "oscillation_ratio")],
+                lookups[step][("left_arm", "oscillation_ratio")],
+            ],
+            dtype=torch.float64,
+        ).nanmean().item()
+        for step in ordered
+    ]
+
+    def relative_reduction(values: list[float]) -> float:
+        baseline = abs(values[0])
+        if baseline <= torch.finfo(torch.float64).eps:
+            return 0.0
+        return (values[0] - values[-1]) / baseline
+
+    second_reduction = relative_reduction(second_p95)
+    delta_reduction = relative_reduction(delta_p95)
+    oscillation_reduction = relative_reduction(oscillation)
+    second_monotonic = all(b <= a for a, b in zip(second_p95, second_p95[1:], strict=False))
+    oscillation_monotonic = all(
+        b <= a for a, b in zip(oscillation, oscillation[1:], strict=False)
+    )
+
+    # These thresholds only choose wording; all raw metrics and reductions are
+    # emitted so the heuristic is never presented as a statistical test.
+    if (
+        second_monotonic
+        and oscillation_monotonic
+        and second_reduction >= 0.20
+        and oscillation_reduction >= 0.20
+    ):
+        classification = "SIGNIFICANT_IMPROVEMENT"
+        text = (
+            "Increasing Euler integration resolution materially improves temporal smoothness. "
+            "Coarse flow integration is likely contributing to rough action trajectories."
+        )
+    elif (
+        abs(delta_reduction) < 0.05
+        and abs(second_reduction) < 0.05
+        and abs(oscillation_reduction) < 0.05
+    ):
+        classification = "LITTLE_OR_NO_IMPROVEMENT"
+        text = (
+            "Increasing Euler integration resolution does not materially improve temporal smoothness. "
+            "The roughness is more likely associated with the learned flow field / trajectory "
+            "distribution than solver resolution."
+        )
+    else:
+        classification = "MIXED_OR_MODEST_CHANGE"
+        text = (
+            "The num_steps effect is mixed or modest; the raw roughness metrics do not support a "
+            "strong attribution to Euler resolution alone."
+        )
+    return {
+        "classification": classification,
+        "text": text,
+        "ordered_steps": ordered,
+        "delta_p95": delta_p95,
+        "second_delta_p95": second_p95,
+        "mean_arm_oscillation": oscillation,
+        "delta_p95_reduction": delta_reduction,
+        "second_delta_p95_reduction": second_reduction,
+        "mean_arm_oscillation_reduction": oscillation_reduction,
+        "heuristic": (
+            "significant requires monotonic >=20% reductions in both robot-unit arm second-delta "
+            "p95 and mean arm oscillation; little/no change requires delta p95, second-delta p95, "
+            "and oscillation absolute reductions all <5%"
+        ),
+    }
+
+
+def _run_num_steps_analysis(
+    *,
+    args: argparse.Namespace,
+    policy: Any,
+    frozen_batch: dict[str, Any],
+    postprocessor: Callable[[torch.Tensor], torch.Tensor],
+    device: torch.device,
+    output_dir: Path,
+    groups: dict[str, list[int]],
+    checkpoint: Path,
+    frozen_path: Path,
+    actual_action_dim: int,
+    checkpoint_compile_model: bool,
+) -> int:
+    step_values = _parse_num_steps_list(args.num_steps_list)
+    noise_shape = (
+        1,
+        int(policy.config.chunk_size),
+        int(policy.config.max_action_dim),
+    )
+    if args.fixed_noise_file:
+        fixed_noise_path = Path(args.fixed_noise_file).expanduser()
+        fixed_noise = _load_fixed_noise(
+            fixed_noise_path, expected_shape=noise_shape, device=device
+        )
+        noise_source = str(fixed_noise_path)
+    else:
+        cuda_devices = []
+        if device.type == "cuda":
+            cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()]
+        with torch.random.fork_rng(devices=cuda_devices):
+            torch.manual_seed(args.noise_seed)
+            with torch.inference_mode():
+                fixed_noise = policy.model.sample_noise(noise_shape, device).detach().clone()
+        noise_source = f"generated once with seed={args.noise_seed}"
+
+    frozen_checksum = nested_checksum(frozen_batch)
+    noise_checksum = nested_checksum(fixed_noise)
+    torch.save(fixed_noise.detach().cpu(), output_dir / "fixed_noise.pt")
+
+    print("Sanity checks: num_steps experiment")
+    print(f"  checkpoint={checkpoint}")
+    print(f"  frozen_batch={frozen_path}")
+    print(f"  device={device}")
+    print(f"  num_steps_list={step_values}")
+    print(f"  runs_per_step={args.runs_per_step} (plus one unmeasured warmup)")
+    print(f"  checkpoint compile_model={checkpoint_compile_model}")
+    print(f"  runtime compile_model={policy.config.compile_model}")
+    print(f"  sample_actions torch-compiled={_is_torch_compiled(policy.model.sample_actions)}")
+    print(f"  RTC enabled={policy.model._rtc_enabled()}")
+    print(f"  fixed_noise source={noise_source}")
+    print(
+        f"  fixed_noise shape={tuple(fixed_noise.shape)} dtype={fixed_noise.dtype} "
+        f"device={fixed_noise.device}"
+    )
+    print(f"  fixed_noise checksum={noise_checksum}")
+    print(f"  frozen batch checksum={frozen_checksum}")
+
+    if policy.config.compile_model or _is_torch_compiled(policy.model.sample_actions):
+        raise RuntimeError("num_steps diagnostic requires an eagerly constructed policy")
+    if policy.model._rtc_enabled():
+        raise RuntimeError("num_steps diagnostic requires RTC to be disabled")
+
+    conditions: dict[int, TrialResults] = {}
+    metric_rows_all: list[dict[str, Any]] = []
+    oscillation_rows_all: list[dict[str, Any]] = []
+    run_rows_all: list[dict[str, Any]] = []
+    robot_lookups: dict[int, dict[tuple[str, str], float]] = {}
+    latency_summaries: dict[int, dict[str, float]] = {}
+
+    for num_steps in step_values:
+        policy.config.num_steps = num_steps
+        if policy.model.config is not policy.config:
+            policy.model.config.num_steps = num_steps
+        if policy.config.num_steps != num_steps or policy.model.config.num_steps != num_steps:
+            raise RuntimeError(f"Failed to apply num_steps={num_steps} to the inference model")
+
+        print(f"\nRunning num_steps={num_steps}...")
+        print(
+            f"  runtime num_steps: policy.config={policy.config.num_steps} "
+            f"model.config={policy.model.config.num_steps}"
+        )
+        result = execute_condition(
+            policy=policy,
+            frozen_batch=frozen_batch,
+            postprocessor=postprocessor,
+            device=device,
+            num_runs=args.runs_per_step,
+            fixed_noise=fixed_noise,
+            warmup_runs=1,
+        )
+        conditions[num_steps] = result
+        if result.noise_checksum != noise_checksum or result.frozen_checksum != frozen_checksum:
+            raise RuntimeError(f"Fairness checksum mismatch at num_steps={num_steps}")
+
+        for stage, actions in (
+            ("raw_policy", result.raw_actions),
+            ("robot_unit", result.robot_actions),
+        ):
+            rows, _, oscillation_rows = analyze_actions(
+                actions[:1], groups, args.oscillation_threshold
+            )
+            if stage == "robot_unit":
+                robot_lookups[num_steps] = _metric_lookup(rows)
+            metric_rows_all.extend(
+                {"num_steps": num_steps, "stage": stage, **row} for row in rows
+            )
+            oscillation_rows_all.extend(
+                {"num_steps": num_steps, "stage": stage, **row}
+                for row in oscillation_rows
+            )
+            # Determinism comparisons need all measured runs, while temporal
+            # metrics deliberately use only representative run 0.
+            _, all_run_rows, _ = analyze_actions(
+                actions, groups, args.oscillation_threshold
+            )
+            run_rows_all.extend(
+                {"num_steps": num_steps, "stage": stage, **row}
+                for row in all_run_rows
+            )
+
+        latency_ms = torch.tensor(result.latencies_s, dtype=torch.float64) * 1000.0
+        latency_summaries[num_steps] = _summary(latency_ms)
+        robot_differences = [
+            {
+                "run": run,
+                "max": (result.robot_actions[run] - result.robot_actions[0]).abs().max().item(),
+                "mean": (result.robot_actions[run] - result.robot_actions[0]).abs().mean().item(),
+            }
+            for run in range(1, args.runs_per_step)
+        ]
+        for difference in robot_differences:
+            print(
+                f"  run{difference['run']} vs run0 robot-unit: "
+                f"max_abs_diff={difference['max']:.8g} "
+                f"mean_abs_diff={difference['mean']:.8g}"
+            )
+        deterministic = all(
+            difference["max"] <= args.determinism_atol for difference in robot_differences
+        )
+        print(f"  deterministic within atol={args.determinism_atol:g}: {deterministic}")
+        print(
+            f"  checksums: fixed_noise={result.noise_checksum} "
+            f"frozen_batch={result.frozen_checksum}"
+        )
+
+        torch.save(result.robot_actions[0], output_dir / f"actions_steps_{num_steps}.pt")
+        torch.save(result.raw_actions[0], output_dir / f"raw_actions_steps_{num_steps}.pt")
+        torch.save(
+            {
+                "raw_policy": result.raw_actions,
+                "robot_unit": result.robot_actions,
+                "latencies_s": result.latencies_s,
+            },
+            output_dir / f"all_runs_steps_{num_steps}.pt",
+        )
+
+    metric_specs = [
+        ("delta_q_median", "arms", "within_chunk_delta_median"),
+        ("delta_q_p90", "arms", "within_chunk_delta_p90"),
+        ("delta_q_p95", "arms", "within_chunk_delta_p95"),
+        ("delta_q_p99", "arms", "within_chunk_delta_p99"),
+        ("delta_q_max", "arms", "within_chunk_delta_max"),
+        ("second_delta_q_median", "arms", "within_chunk_second_delta_median"),
+        ("second_delta_q_p90", "arms", "within_chunk_second_delta_p90"),
+        ("second_delta_q_p95", "arms", "within_chunk_second_delta_p95"),
+        ("second_delta_q_p99", "arms", "within_chunk_second_delta_p99"),
+        ("second_delta_q_max", "arms", "within_chunk_second_delta_max"),
+        ("right_oscillation", "right_arm", "oscillation_ratio"),
+        ("left_oscillation", "left_arm", "oscillation_ratio"),
+    ]
+    summary_rows = [
+        {
+            "metric": label,
+            **{
+                f"steps={step}": robot_lookups[step][(scope, metric)]
+                for step in step_values
+            },
+        }
+        for label, scope, metric in metric_specs
+    ]
+    for statistic in ("mean", "median", "min", "max"):
+        summary_rows.append(
+            {
+                "metric": f"inference_latency_{statistic}_ms",
+                **{
+                    f"steps={step}": latency_summaries[step][statistic]
+                    for step in step_values
+                },
+            }
+        )
+
+    print("\nRobot-unit temporal roughness summary")
+    header = f"{'Metric':36s}" + "".join(f" {f'steps={step}':>16s}" for step in step_values)
+    print(header)
+    print("-" * len(header))
+    for row in summary_rows:
+        values = "".join(f" {float(row[f'steps={step}']):16.8g}" for step in step_values)
+        print(f"{row['metric']:36s}{values}")
+
+    baseline_step = step_values[0]
+    latency_increase = {
+        step: latency_summaries[step]["mean"] / latency_summaries[baseline_step]["mean"]
+        for step in step_values
+    }
+    print(f"\nMean latency multipliers vs steps={baseline_step}:")
+    for step in step_values:
+        print(f"  steps={step}: {latency_increase[step]:.4f}x")
+
+    if 10 in robot_lookups:
+        reference = {
+            "delta_q_median": 0.02407157,
+            "delta_q_p95": 0.053782679,
+            "delta_q_max": 0.056116834,
+            "second_delta_q_median": 0.027014613,
+            "second_delta_q_p95": 0.052834749,
+            "second_delta_q_max": 0.05941534,
+            "right_oscillation": 0.90625,
+            "left_oscillation": 0.24117647,
+        }
+        current = {row[0]: robot_lookups[10][(row[1], row[2])] for row in metric_specs}
+        print("\nsteps=10 reference sanity check (different noise may legitimately differ):")
+        for metric, reference_value in reference.items():
+            print(
+                f"  {metric}: current={current[metric]:.8g} "
+                f"previous={reference_value:.8g} diff={current[metric] - reference_value:+.8g}"
+            )
+
+    interpretation = _num_steps_interpretation(step_values, robot_lookups)
+    print(f"\nINTERPRETATION [{interpretation['classification']}]")
+    print(f"  {interpretation['text']}")
+    if "heuristic" in interpretation:
+        print(f"  Heuristic only: {interpretation['heuristic']}")
+
+    _write_csv(
+        output_dir / "num_steps_summary.csv",
+        summary_rows,
+        ["metric", *(f"steps={step}" for step in step_values)],
+    )
+    _write_csv(
+        output_dir / "num_steps_metrics.csv",
+        metric_rows_all,
+        ["num_steps", "stage", "scope", "metric", "value"],
+    )
+    _write_csv(
+        output_dir / "num_steps_run_differences.csv",
+        run_rows_all,
+        [
+            "num_steps",
+            "stage",
+            "run",
+            "rmse_vs_run0",
+            "l2_vs_run0",
+            "mean_abs_vs_run0",
+            "max_abs_vs_run0",
+        ],
+    )
+    _write_csv(
+        output_dir / "num_steps_oscillation_by_joint.csv",
+        oscillation_rows_all,
+        ["num_steps", "stage", "scope", "action_index", "ratio", "eligible_pairs"],
+    )
+
+    frozen_checksum_after = nested_checksum(frozen_batch)
+    metadata = {
+        "checkpoint": str(checkpoint),
+        "frozen_batch": str(frozen_path),
+        "device": str(device),
+        "num_steps": step_values,
+        "runs_per_step": args.runs_per_step,
+        "warmup_runs_per_step": 1,
+        "chunk_size": int(policy.config.chunk_size),
+        "max_action_dim": int(policy.config.max_action_dim),
+        "actual_action_dim": actual_action_dim,
+        "groups": groups,
+        "oscillation_threshold": args.oscillation_threshold,
+        "checkpoint_compile_model": checkpoint_compile_model,
+        "runtime_compile_model": bool(policy.config.compile_model),
+        "sample_actions_torch_compiled": _is_torch_compiled(policy.model.sample_actions),
+        "rtc_enabled": bool(policy.model._rtc_enabled()),
+        "fixed_noise_source": noise_source,
+        "fixed_noise_checksum": noise_checksum,
+        "fixed_noise_checksums_by_step": {
+            str(step): conditions[step].noise_checksum for step in step_values
+        },
+        "frozen_checksum_before": frozen_checksum,
+        "frozen_checksum_after": frozen_checksum_after,
+        "frozen_checksums_by_step": {
+            str(step): conditions[step].frozen_checksum for step in step_values
+        },
+        "frozen_unchanged": frozen_checksum == frozen_checksum_after,
+        "latency_ms": latency_summaries,
+        "latency_multiplier_vs_first_condition": latency_increase,
+        "interpretation": interpretation,
+    }
+    with (output_dir / "num_steps_summary.json").open("w") as stream:
+        json.dump(metadata, stream, indent=2)
+
+    print(f"\nFrozen batch checksum after run: {frozen_checksum_after}")
+    print(f"Frozen batch unchanged={frozen_checksum == frozen_checksum_after}")
+    print(f"Results written to {output_dir}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Separate SmolVLA flow-noise variability from within-chunk roughness."
@@ -503,6 +951,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--frozen_batch", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num_runs", type=int, default=30)
+    parser.add_argument(
+        "--num_steps_list",
+        "--num-steps-list",
+        dest="num_steps_list",
+        help="Run fixed-noise Euler-resolution mode, for example 10,20,40.",
+    )
+    parser.add_argument(
+        "--runs_per_step",
+        "--runs-per-step",
+        dest="runs_per_step",
+        type=int,
+        default=3,
+    )
+    parser.add_argument(
+        "--fixed_noise_file",
+        "--fixed-noise-file",
+        dest="fixed_noise_file",
+        help="Reuse a saved fixed-noise tensor instead of generating one.",
+    )
+    parser.add_argument("--noise_seed", "--noise-seed", dest="noise_seed", type=int, default=0)
     parser.add_argument("--output_dir", default="outputs/frozen_noise_analysis")
     parser.add_argument("--also_test_zero_noise", action="store_true")
     parser.add_argument("--oscillation_threshold", type=float, default=0.005)
@@ -518,8 +986,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.num_runs < 2:
+    if args.num_steps_list is None and args.num_runs < 2:
         raise ValueError("--num_runs must be at least 2")
+    if args.num_steps_list is not None and args.runs_per_step < 2:
+        raise ValueError("--runs-per-step must be at least 2 for determinism checks")
     if args.oscillation_threshold < 0:
         raise ValueError("--oscillation_threshold must be non-negative")
 
@@ -533,6 +1003,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Deferred imports keep server capture and metric unit tests independent of
     # heavyweight model/tokenizer initialization.
+    from lerobot.configs import PreTrainedConfig
     from lerobot.policies import get_policy_class, make_pre_post_processors
 
     frozen_batch = torch.load(frozen_path, map_location="cpu", weights_only=False)
@@ -541,7 +1012,21 @@ def main(argv: list[str] | None = None) -> int:
     checksum_before = nested_checksum(frozen_batch)
 
     policy_class = get_policy_class("smolvla")
-    policy = policy_class.from_pretrained(checkpoint)
+    checkpoint_compile_model = False
+    if args.num_steps_list is not None:
+        # compile_model is consumed inside VLAFlowMatching.__init__. Loading and
+        # overriding the config before policy construction prevents a compiled
+        # sample_actions callable from ever being installed.
+        policy_config = PreTrainedConfig.from_pretrained(checkpoint)
+        checkpoint_compile_model = bool(policy_config.compile_model)
+        policy_config.compile_model = False
+        policy_config.device = str(device)
+        # RTC changes the Euler velocity path and is outside this single-variable
+        # experiment. None also avoids constructing a debug-only RTC processor.
+        policy_config.rtc_config = None
+        policy = policy_class.from_pretrained(checkpoint, config=policy_config)
+    else:
+        policy = policy_class.from_pretrained(checkpoint)
     policy.to(device)
     policy.eval()
     _, postprocessor = make_pre_post_processors(
@@ -567,6 +1052,21 @@ def main(argv: list[str] | None = None) -> int:
     batch_size = int(state.shape[0])
     if batch_size != 1:
         raise ValueError(f"Expected a captured real-observation batch size of 1, got {batch_size}")
+
+    if args.num_steps_list is not None:
+        return _run_num_steps_analysis(
+            args=args,
+            policy=policy,
+            frozen_batch=frozen_batch,
+            postprocessor=postprocessor,
+            device=device,
+            output_dir=output_dir,
+            groups=groups,
+            checkpoint=checkpoint,
+            frozen_path=frozen_path,
+            actual_action_dim=actual_action_dim,
+            checkpoint_compile_model=checkpoint_compile_model,
+        )
 
     noise_shape = (
         batch_size,
@@ -716,6 +1216,9 @@ def main(argv: list[str] | None = None) -> int:
         torch.save(results.robot_actions, output_dir / f"{stem}_robot_actions.pt")
         # Short name denotes the final deployment/robot-unit action tensor.
         torch.save(results.robot_actions, output_dir / f"{stem}_actions.pt")
+    # Keep the exact x_1 sample so a later num_steps sweep can reproduce the
+    # fixed-noise baseline with --fixed-noise-file.
+    torch.save(fixed_noise.detach().cpu(), output_dir / "fixed_noise.pt")
 
     _write_action_csv(
         output_dir / "robot_actions.csv",
@@ -729,7 +1232,15 @@ def main(argv: list[str] | None = None) -> int:
     _write_csv(
         output_dir / "run_differences.csv",
         run_rows_all,
-        ["condition", "stage", "run", "rmse_vs_run0", "l2_vs_run0", "max_abs_vs_run0"],
+        [
+            "condition",
+            "stage",
+            "run",
+            "rmse_vs_run0",
+            "l2_vs_run0",
+            "mean_abs_vs_run0",
+            "max_abs_vs_run0",
+        ],
     )
     _write_csv(
         output_dir / "oscillation_by_joint.csv",

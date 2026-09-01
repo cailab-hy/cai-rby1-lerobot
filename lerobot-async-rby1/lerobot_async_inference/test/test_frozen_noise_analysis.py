@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -13,6 +14,7 @@ from lerobot_async_inference.frozen_noise_analysis import (
     diagnose_questions,
     execute_condition,
     nested_checksum,
+    _run_num_steps_analysis,
 )
 from lerobot_async_inference.policy_server import PolicyServer
 
@@ -202,9 +204,96 @@ def test_explicit_q1_q2_q3_and_primary_classifications() -> None:
     assert case_c["primary_classification"] == "C"
 
 
+class FakeNumStepsModel:
+    def __init__(self, config: SimpleNamespace) -> None:
+        self.config = config
+
+    def sample_noise(self, shape, device) -> torch.Tensor:
+        return torch.randn(shape, device=device)
+
+    def sample_actions(self) -> None:
+        return None
+
+    def _rtc_enabled(self) -> bool:
+        return False
+
+
+class FakeNumStepsPolicy:
+    def __init__(self) -> None:
+        self.config = SimpleNamespace(
+            num_steps=10,
+            chunk_size=4,
+            max_action_dim=3,
+            compile_model=False,
+        )
+        self.model = FakeNumStepsModel(self.config)
+
+    def eval(self) -> "FakeNumStepsPolicy":
+        return self
+
+    def reset(self) -> None:
+        pass
+
+    def predict_action_chunk(
+        self, batch: dict[str, torch.Tensor], noise: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        assert noise is not None
+        # Deterministic, temporally nonconstant output whose roughness changes
+        # with the runtime config, exercising the complete sweep/report path.
+        scale = 1.0 / self.config.num_steps
+        return noise[:, :, :3] * scale + batch["observation.state"][:, None, :3]
+
+
+def test_num_steps_mode_smoke_writes_expected_outputs(tmp_path) -> None:
+    args = SimpleNamespace(
+        num_steps_list="2,4",
+        fixed_noise_file=None,
+        noise_seed=123,
+        runs_per_step=2,
+        oscillation_threshold=0.005,
+        determinism_atol=1e-7,
+    )
+    frozen = {"observation.state": torch.zeros(1, 3)}
+    groups = {
+        "right_arm": [0],
+        "left_arm": [1],
+        "gripper": [2],
+        "arms": [0, 1],
+    }
+    result = _run_num_steps_analysis(
+        args=args,
+        policy=FakeNumStepsPolicy(),
+        frozen_batch=frozen,
+        postprocessor=lambda action: action,
+        device=torch.device("cpu"),
+        output_dir=tmp_path,
+        groups=groups,
+        checkpoint=Path("checkpoint"),
+        frozen_path=Path("frozen.pt"),
+        actual_action_dim=3,
+        checkpoint_compile_model=False,
+    )
+
+    assert result == 0
+    assert (tmp_path / "num_steps_summary.csv").is_file()
+    assert (tmp_path / "num_steps_summary.json").is_file()
+    assert (tmp_path / "actions_steps_2.pt").is_file()
+    assert (tmp_path / "actions_steps_4.pt").is_file()
+    assert (tmp_path / "fixed_noise.pt").is_file()
+    assert torch.equal(
+        torch.load(tmp_path / "all_runs_steps_2.pt", weights_only=False)["robot_unit"][0],
+        torch.load(tmp_path / "all_runs_steps_2.pt", weights_only=False)["robot_unit"][1],
+    )
+
+
 def _run_server_dump_test() -> None:
     with tempfile.TemporaryDirectory() as directory:
         test_server_dump_is_one_shot_and_cpu_cloned(Path(directory))
+
+
+def _run_num_steps_smoke_test() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        test_num_steps_mode_smoke_writes_expected_outputs(Path(directory))
 
 
 def load_tests(loader, tests, pattern):  # noqa: ARG001
@@ -215,6 +304,7 @@ def load_tests(loader, tests, pattern):  # noqa: ARG001
         test_random_and_fixed_conditions_reset_clone_and_stack,
         test_delta_second_delta_and_sign_flip_metrics,
         test_explicit_q1_q2_q3_and_primary_classifications,
+        _run_num_steps_smoke_test,
         _run_server_dump_test,
     ):
         suite.addTest(unittest.FunctionTestCase(function))
