@@ -191,6 +191,12 @@ class RobotClient:
                 config.actions_per_chunk,
                 config.policy_device,
                 timing_diagnostics=config.timing_diagnostics,
+                rtc_enabled=config.rtc_enabled,
+                rtc_mode=config.rtc_mode,
+                rtc_execution_horizon=config.rtc_execution_horizon,
+                rtc_max_guidance_weight=config.rtc_max_guidance_weight,
+                rtc_prefix_attention_schedule=config.rtc_prefix_attention_schedule,
+                rtc_diagnostics_dir=config.rtc_diagnostics_dir,
             )
             self.channel = grpc.insecure_channel(
                 self.server_address, grpc_channel_options(initial_backoff=f"{config.environment_dt:.4f}s")

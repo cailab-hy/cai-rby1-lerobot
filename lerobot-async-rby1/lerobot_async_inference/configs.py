@@ -251,6 +251,27 @@ class RobotClientConfig:
         default=False,
         metadata={"help": "Enable low-overhead control-loop timing diagnostics"},
     )
+    rtc_enabled: bool = field(
+        default=False,
+        metadata={"help": "Enable inference-time guided Real-Time Chunking for SmolVLA"},
+    )
+    rtc_mode: str = field(
+        default="guided",
+        metadata={"help": "RTC mode (only guided is valid for ordinary SmolVLA checkpoints)"},
+    )
+    rtc_execution_horizon: int = field(
+        default=10, metadata={"help": "RTC prefix guidance execution horizon in frames"}
+    )
+    rtc_max_guidance_weight: float = field(
+        default=10.0, metadata={"help": "Maximum guided RTC correction weight"}
+    )
+    rtc_prefix_attention_schedule: str = field(
+        default="EXP", metadata={"help": "RTC prefix attention schedule: ZEROS, ONES, LINEAR, or EXP"}
+    )
+    rtc_diagnostics_dir: str = field(
+        default="outputs",
+        metadata={"help": "Server-side directory for rtc_diagnostics_<timestamp>.jsonl"},
+    )
 
     @property
     def environment_dt(self) -> float:
@@ -286,6 +307,21 @@ class RobotClientConfig:
 
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
+
+        if self.rtc_mode.lower() != "guided":
+            raise ValueError("Only --rtc_mode=guided is supported for this SmolVLA checkpoint")
+        self.rtc_mode = self.rtc_mode.lower()
+        if self.rtc_execution_horizon <= 0:
+            raise ValueError("rtc_execution_horizon must be positive")
+        if not math.isfinite(self.rtc_max_guidance_weight) or self.rtc_max_guidance_weight <= 0:
+            raise ValueError("rtc_max_guidance_weight must be finite and positive")
+        self.rtc_prefix_attention_schedule = self.rtc_prefix_attention_schedule.upper()
+        if self.rtc_prefix_attention_schedule not in {"ZEROS", "ONES", "LINEAR", "EXP"}:
+            raise ValueError(
+                "rtc_prefix_attention_schedule must be one of ZEROS, ONES, LINEAR, EXP"
+            )
+        if self.rtc_enabled and self.backend != "grpc":
+            raise ValueError("RTC is supported only by the gRPC SmolVLA backend")
 
         validate_image_resize_scale(self.image_resize_scale)
 
@@ -348,4 +384,10 @@ class RobotClientConfig:
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "timing_diagnostics": self.timing_diagnostics,
             "aggregate_fn_name": self.aggregate_fn_name,
+            "rtc_enabled": self.rtc_enabled,
+            "rtc_mode": self.rtc_mode,
+            "rtc_execution_horizon": self.rtc_execution_horizon,
+            "rtc_max_guidance_weight": self.rtc_max_guidance_weight,
+            "rtc_prefix_attention_schedule": self.rtc_prefix_attention_schedule,
+            "rtc_diagnostics_dir": self.rtc_diagnostics_dir,
         }

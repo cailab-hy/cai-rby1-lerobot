@@ -37,7 +37,7 @@ lerobot-robot-client \
     }
   }' \
   --policy_type=smolvla \
-  --pretrained_name_or_path=/home/cai/rby1-lerobot/cai-rby1-lerobot/outputs/smolVLA_bs32_ViT_VLM_expert_left_only/checkpoints/040000/pretrained_model \
+  --pretrained_name_or_path=/home/cai/rby1-lerobot/cai-rby1-lerobot/outputs/smolVLA_bs32_expert_only_left_only_state16/checkpoints/020000/pretrained_model \
   --policy_device=cuda \
   --client_device=cpu \
   --actions_per_chunk=50 \

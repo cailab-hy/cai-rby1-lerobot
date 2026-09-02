@@ -272,6 +272,12 @@ class RemotePolicyConfig:
     device: str = "cpu"
     rename_map: dict[str, str] = field(default_factory=dict)
     timing_diagnostics: bool = False
+    rtc_enabled: bool = False
+    rtc_mode: str = "guided"
+    rtc_execution_horizon: int = 10
+    rtc_max_guidance_weight: float = 10.0
+    rtc_prefix_attention_schedule: str = "EXP"
+    rtc_diagnostics_dir: str = "outputs"
 
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:

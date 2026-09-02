@@ -63,6 +63,7 @@ from .helpers import (
     raw_observation_to_observation,
 )
 from .image_transport import decode_observation_images
+from .rtc import RTCDiagnosticsWriter, RTCRequest, RTCState, overlap_metrics
 
 
 class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
@@ -104,6 +105,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
         self.pretrained_name_or_path: str | None = None
+        self.rtc_enabled = False
+        self.rtc_mode = "guided"
+        self.rtc_execution_horizon = 10
+        self.rtc_max_guidance_weight = 10.0
+        self.rtc_prefix_attention_schedule = "EXP"
+        self._rtc_state: RTCState | None = None
+        self._rtc_diagnostics: RTCDiagnosticsWriter | None = None
 
     @property
     def running(self):
@@ -123,6 +131,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self._predicted_timesteps = set()
 
         self.timing_diagnostics = False
+        self._rtc_state = None
+        if self._rtc_diagnostics is not None:
+            self._rtc_diagnostics.close()
+            self._rtc_diagnostics = None
 
     def Ready(self, request, context):  # noqa: N802
         client_id = context.peer()
@@ -174,6 +186,49 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         start = time.perf_counter()
         self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
         self.policy.to(self.device)
+
+        self.rtc_enabled = bool(getattr(policy_specs, "rtc_enabled", False))
+        self.rtc_mode = str(getattr(policy_specs, "rtc_mode", "guided")).lower()
+        self.rtc_execution_horizon = int(getattr(policy_specs, "rtc_execution_horizon", 10))
+        self.rtc_max_guidance_weight = float(
+            getattr(policy_specs, "rtc_max_guidance_weight", 10.0)
+        )
+        self.rtc_prefix_attention_schedule = str(
+            getattr(policy_specs, "rtc_prefix_attention_schedule", "EXP")
+        ).upper()
+        if self.rtc_enabled:
+            if self.policy_type != "smolvla" or self.rtc_mode != "guided":
+                raise ValueError(
+                    "Guided RTC is supported only for policy_type=smolvla and rtc_mode=guided"
+                )
+            from lerobot.configs import RTCAttentionSchedule
+            from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+            rtc_config = RTCConfig(
+                enabled=True,
+                prefix_attention_schedule=RTCAttentionSchedule[
+                    self.rtc_prefix_attention_schedule
+                ],
+                max_guidance_weight=self.rtc_max_guidance_weight,
+                execution_horizon=self.rtc_execution_horizon,
+            )
+            # Runtime-only injection. from_pretrained has already loaded the checkpoint,
+            # and no checkpoint/config files are written.
+            self.policy.config.rtc_config = rtc_config
+            self.policy.init_rtc_processor()
+            self._rtc_state = RTCState(self.config.fps)
+            self._rtc_diagnostics = RTCDiagnosticsWriter(
+                getattr(policy_specs, "rtc_diagnostics_dir", "outputs")
+            )
+            self.logger.info(
+                "[RTC] enabled=True mode=%s execution_horizon=%d "
+                "max_guidance_weight=%.1f schedule=%s diagnostics=%s",
+                self.rtc_mode,
+                self.rtc_execution_horizon,
+                self.rtc_max_guidance_weight,
+                self.rtc_prefix_attention_schedule,
+                self._rtc_diagnostics.path,
+            )
 
         # Load preprocessor and postprocessor, overriding device to match requested device
         device_override = {"device": self.device}
@@ -417,9 +472,22 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             for i, action in enumerate(action_chunk)
         ]
 
-    def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
+    def _get_action_chunk(
+        self,
+        observation: dict[str, torch.Tensor],
+        rtc_request: RTCRequest | None = None,
+    ) -> torch.Tensor:
         """Get an action chunk from the policy. The chunk contains only"""
-        chunk = self.policy.predict_action_chunk(observation)
+        if rtc_request is not None and rtc_request.applied:
+            chunk = self.policy.predict_action_chunk(
+                observation,
+                inference_delay=rtc_request.inference_delay_frames,
+                prev_chunk_left_over=rtc_request.prefix,
+                execution_horizon=self.rtc_execution_horizon,
+            )
+        else:
+            # Preserve the exact pre-RTC call path when disabled or on the first request.
+            chunk = self.policy.predict_action_chunk(observation)
         if chunk.ndim != 3:
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
 
@@ -520,9 +588,24 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             )
 
         """3. Get action chunk"""
+        rtc_request = (
+            self._rtc_state.prepare(observation_t.get_timestep())
+            if self.rtc_enabled and self._rtc_state is not None
+            else None
+        )
+        if rtc_request is not None:
+            if rtc_request.applied:
+                self.logger.info(
+                    "[RTC] guided: prefix_len=%d inference_delay=%d shift=%d",
+                    rtc_request.prefix.shape[0],
+                    rtc_request.inference_delay_frames,
+                    rtc_request.shift,
+                )
+            else:
+                self.logger.info("[RTC] bypass: %s", rtc_request.bypass_reason)
         inference_start_wall_time = time.time() if prepared_capture is not None else None
         start_inference = time.perf_counter()
-        action_tensor = self._get_action_chunk(observation)
+        action_tensor = self._get_action_chunk(observation, rtc_request=rtc_request)
         inference_time = time.perf_counter() - start_inference
         inference_end_wall_time = time.time() if prepared_capture is not None else None
         self.logger.info(
@@ -537,8 +620,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         _, chunk_size, _ = action_tensor.shape
         raw_capture_clone_started = time.perf_counter() if prepared_capture is not None else 0.0
         raw_action_tensor_for_capture = None
+        raw_action_tensor_for_rtc = None
         if prepared_capture is not None:
             raw_action_tensor_for_capture = action_tensor.squeeze(0).detach().clone()
+        if self.rtc_enabled:
+            raw_action_tensor_for_rtc = action_tensor.squeeze(0).detach().clone()
         raw_capture_clone_ms = (
             (time.perf_counter() - raw_capture_clone_started) * 1000
             if prepared_capture is not None
@@ -559,6 +645,62 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
 
         action_tensor = action_tensor.detach().cpu()
+        if self.rtc_enabled and not bool(torch.isfinite(action_tensor).all()):
+            raise RuntimeError("Policy produced NaN or Inf; refusing to return an action chunk")
+        if self.rtc_enabled and self._rtc_state is not None:
+            if raw_action_tensor_for_rtc is None or not bool(
+                torch.isfinite(raw_action_tensor_for_rtc).all()
+            ):
+                raise RuntimeError("RTC produced NaN or Inf; refusing to return an action chunk")
+            metrics = overlap_metrics(
+                rtc_request.previous_robot_leftover if rtc_request is not None else None,
+                action_tensor,
+            )
+            self._rtc_state.complete(
+                raw_chunk=raw_action_tensor_for_rtc,
+                robot_chunk=action_tensor,
+                timestep=observation_t.get_timestep(),
+                latency_s=inference_time,
+            )
+            record = {
+                "request_id": observation_t.get_timestep(),
+                "policy_timestamp": observation_t.get_timestamp(),
+                "rtc_enabled": True,
+                "rtc_applied": bool(rtc_request and rtc_request.applied),
+                "rtc_bypass_reason": rtc_request.bypass_reason if rtc_request else None,
+                "mode": self.rtc_mode,
+                "execution_horizon": self.rtc_execution_horizon,
+                "max_guidance_weight": self.rtc_max_guidance_weight,
+                "prefix_schedule": self.rtc_prefix_attention_schedule,
+                "inference_latency_ms": inference_time * 1000,
+                "inference_delay_frames": (
+                    rtc_request.inference_delay_frames if rtc_request else 0
+                ),
+                "delay_frames_float": rtc_request.delay_frames_float if rtc_request else 0.0,
+                "prev_leftover_count": (
+                    int(rtc_request.prefix.shape[0])
+                    if rtc_request is not None and rtc_request.prefix is not None
+                    else 0
+                ),
+                "previous_chunk_shift": rtc_request.shift if rtc_request else 0,
+                **metrics,
+            }
+            self.logger.info(
+                "[RTC] enabled=True mode=%s execution_horizon=%d max_guidance_weight=%.1f "
+                "schedule=%s inference_latency_ms=%.3f inference_delay_frames=%d "
+                "delay_frames_float=%.3f prev_chunk_left_over_length=%d rtc_applied=%s",
+                self.rtc_mode,
+                self.rtc_execution_horizon,
+                self.rtc_max_guidance_weight,
+                self.rtc_prefix_attention_schedule,
+                inference_time * 1000,
+                record["inference_delay_frames"],
+                record["delay_frames_float"],
+                record["prev_leftover_count"],
+                record["rtc_applied"],
+            )
+            if self._rtc_diagnostics is not None:
+                self._rtc_diagnostics.write(record)
         if prepared_capture is not None:
             self._diagnostic_capture.submit(
                 prepared_capture,

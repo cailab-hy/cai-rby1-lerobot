@@ -8,12 +8,21 @@ import itertools
 import json
 import math
 import re
+import time
 from pathlib import Path
 from typing import Any
 
 import torch
 
-from .frozen_noise_analysis import execute_condition, nested_checksum
+from .frozen_noise_analysis import (
+    TrialResults,
+    _synchronize,
+    clone_to_device,
+    execute_condition,
+    nested_checksum,
+    postprocess_action_chunk,
+)
+from .rtc import latency_to_delay_frames
 
 
 PERCENTILES = (0.50, 0.90, 0.95, 0.99)
@@ -594,6 +603,133 @@ def _capture_overhead_summary(metadata_rows: list[dict[str, Any]]) -> dict[str, 
     }
 
 
+def _latency_summary(latencies_s: list[float], runway_s: float) -> dict[str, float]:
+    values = torch.tensor(latencies_s, dtype=torch.float64)
+    if values.numel() == 0:
+        return {
+            "mean_ms": math.nan,
+            "median_ms": math.nan,
+            "p95_ms": math.nan,
+            "max_ms": math.nan,
+            "queue_runway_ms": runway_s * 1000,
+            "p95_runway_fraction": math.nan,
+        }
+    p95 = float(torch.quantile(values, 0.95))
+    return {
+        "mean_ms": float(values.mean() * 1000),
+        "median_ms": float(values.median() * 1000),
+        "p95_ms": p95 * 1000,
+        "max_ms": float(values.max() * 1000),
+        "queue_runway_ms": runway_s * 1000,
+        "p95_runway_fraction": p95 / runway_s,
+    }
+
+
+def execute_sequential_rtc_condition(
+    *,
+    policy: Any,
+    selected: list[dict[str, Any]],
+    batches: dict[int, dict[str, Any]],
+    postprocessor: Any,
+    device: torch.device,
+    num_runs: int,
+    fixed_noise: torch.Tensor,
+    fps: float,
+    execution_horizon: int,
+) -> dict[int, TrialResults]:
+    """Replay a temporal capture sequence, threading the previous raw chunk through RTC."""
+    raw_by_capture: dict[int, list[torch.Tensor]] = {
+        int(row["capture_id"]): [] for row in selected
+    }
+    robot_by_capture: dict[int, list[torch.Tensor]] = {
+        int(row["capture_id"]): [] for row in selected
+    }
+    latency_by_capture: dict[int, list[float]] = {
+        int(row["capture_id"]): [] for row in selected
+    }
+    frozen_checksums = {
+        int(row["capture_id"]): nested_checksum(batches[int(row["capture_id"])])
+        for row in selected
+    }
+    noise_checksum = nested_checksum(fixed_noise)
+    reference_delays: dict[int, int] = {}
+
+    for _run in range(num_runs):
+        policy.reset()
+        previous_raw: torch.Tensor | None = None
+        previous_metadata: dict[str, Any] | None = None
+        measured_latencies: list[float] = []
+        for metadata in selected:
+            capture_id = int(metadata["capture_id"])
+            batch = clone_to_device(batches[capture_id], device)
+            if nested_checksum(batch) != frozen_checksums[capture_id]:
+                raise RuntimeError(f"Fresh RTC batch differs for capture {capture_id}")
+
+            prefix = None
+            if previous_raw is not None and previous_metadata is not None:
+                shift, _, _, _ = estimate_frame_shift(previous_metadata, metadata, fps)
+                if shift is not None and shift < previous_raw.shape[0]:
+                    prefix = previous_raw[shift:].detach().clone()
+            delay, _ = latency_to_delay_frames(max(measured_latencies, default=0.0), fps)
+            if _run > 0:
+                delay = reference_delays[capture_id]
+            kwargs: dict[str, Any] = {}
+            if prefix is not None and prefix.shape[0] > 0 and bool(torch.isfinite(prefix).all()):
+                kwargs = {
+                    "inference_delay": delay,
+                    "prev_chunk_left_over": prefix,
+                    "execution_horizon": execution_horizon,
+                }
+
+            noise_i = fixed_noise.detach().clone()
+            _synchronize(device)
+            started = time.perf_counter()
+            # RTC's guided denoiser uses autograd internally, so torch.inference_mode()
+            # must not wrap this call. SmolVLAPolicy already applies torch.no_grad().
+            raw = policy.predict_action_chunk(batch, noise=noise_i, **kwargs)
+            _synchronize(device)
+            elapsed = time.perf_counter() - started
+            measured_latencies.append(elapsed)
+            if _run == 0:
+                reference_delays[capture_id] = delay
+
+            if raw.ndim != 3 or raw.shape[0] != 1 or not bool(torch.isfinite(raw).all()):
+                raise RuntimeError(
+                    f"Invalid guided RTC output for capture {capture_id}: {tuple(raw.shape)}"
+                )
+            raw_cpu = raw.squeeze(0).detach().clone().cpu()
+            robot_cpu = postprocess_action_chunk(raw, postprocessor).squeeze(0).detach().clone().cpu()
+            raw_by_capture[capture_id].append(raw_cpu)
+            robot_by_capture[capture_id].append(robot_cpu)
+            latency_by_capture[capture_id].append(elapsed)
+            previous_raw = raw_cpu.to(device)
+            previous_metadata = metadata
+
+    if nested_checksum(fixed_noise) != noise_checksum:
+        raise RuntimeError("Shared RTC fixed noise was mutated")
+    return {
+        capture_id: TrialResults(
+            raw_actions=torch.stack(raw_by_capture[capture_id]),
+            robot_actions=torch.stack(robot_by_capture[capture_id]),
+            latencies_s=latency_by_capture[capture_id],
+            frozen_checksum=frozen_checksums[capture_id],
+            noise_checksum=noise_checksum,
+        )
+        for capture_id in raw_by_capture
+    }
+
+
+def _parse_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
@@ -618,6 +754,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--replanning-rmse-threshold", type=float, default=0.05)
     parser.add_argument("--direction-mismatch-threshold", type=float, default=0.50)
     parser.add_argument("--execution-roughness-ratio", type=float, default=2.0)
+    parser.add_argument("--rtc-enabled", "--rtc_enabled", type=_parse_bool, default=False)
+    parser.add_argument("--rtc-mode", "--rtc_mode", default="guided")
+    parser.add_argument(
+        "--rtc-execution-horizon", "--rtc_execution_horizon", type=int, default=10
+    )
+    parser.add_argument(
+        "--rtc-max-guidance-weight", "--rtc_max_guidance_weight", type=float, default=10.0
+    )
+    parser.add_argument(
+        "--rtc-prefix-attention-schedule",
+        "--rtc_prefix_attention_schedule",
+        default="EXP",
+    )
     return parser
 
 
@@ -638,6 +787,14 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.last_n <= 0 or args.random_runs_per_capture < 2 or args.fixed_runs_per_capture < 3:
         raise ValueError("last-n > 0, random runs >= 2, and fixed runs >= 3 are required")
+    if args.rtc_mode.lower() != "guided":
+        raise ValueError("Only guided RTC is valid for an ordinary SmolVLA checkpoint")
+    args.rtc_mode = args.rtc_mode.lower()
+    args.rtc_prefix_attention_schedule = args.rtc_prefix_attention_schedule.upper()
+    if args.rtc_prefix_attention_schedule not in {"ZEROS", "ONES", "LINEAR", "EXP"}:
+        raise ValueError("Invalid RTC prefix attention schedule")
+    if args.rtc_execution_horizon <= 0 or args.rtc_max_guidance_weight <= 0:
+        raise ValueError("RTC execution horizon and maximum guidance weight must be positive")
     capture_dir = Path(args.capture_dir).expanduser()
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -704,8 +861,21 @@ def main(argv: list[str] | None = None) -> int:
     policy.config.num_steps = args.num_steps
     if getattr(policy, "model", None) is not None and policy.model.config is not policy.config:
         policy.model.config.num_steps = args.num_steps
-    if hasattr(policy.model, "_rtc_enabled") and policy.model._rtc_enabled():
-        raise RuntimeError("Near-grasp replay requires RTC disabled, matching the live rollout")
+    if args.rtc_enabled:
+        from lerobot.configs import RTCAttentionSchedule
+        from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+        policy.config.rtc_config = RTCConfig(
+            enabled=True,
+            prefix_attention_schedule=RTCAttentionSchedule[
+                args.rtc_prefix_attention_schedule
+            ],
+            max_guidance_weight=args.rtc_max_guidance_weight,
+            execution_horizon=args.rtc_execution_horizon,
+        )
+        policy.init_rtc_processor()
+    elif hasattr(policy, "_rtc_enabled") and policy._rtc_enabled():
+        raise RuntimeError("RTC OFF replay unexpectedly loaded an RTC-enabled checkpoint config")
     _, postprocessor = make_pre_post_processors(
         policy.config,
         pretrained_path=str(checkpoint),
@@ -722,6 +892,20 @@ def main(argv: list[str] | None = None) -> int:
     fixed_noise_checksum = nested_checksum(fixed_noise)
     torch.save(fixed_noise.detach().cpu(), output_dir / "fixed_noise.pt")
 
+    sequential_rtc_results = None
+    if args.rtc_enabled:
+        sequential_rtc_results = execute_sequential_rtc_condition(
+            policy=policy,
+            selected=selected,
+            batches=batches,
+            postprocessor=postprocessor,
+            device=device,
+            num_runs=args.fixed_runs_per_capture,
+            fixed_noise=fixed_noise,
+            fps=args.fps,
+            execution_horizon=args.rtc_execution_horizon,
+        )
+
     fixed_chunks: dict[int, torch.Tensor] = {}
     random_chunks: dict[int, torch.Tensor] = {}
     fixed_rows: list[dict[str, Any]] = []
@@ -729,6 +913,7 @@ def main(argv: list[str] | None = None) -> int:
     joint_rows: list[dict[str, Any]] = []
     capture_rows: list[dict[str, Any]] = []
     comparison_rows: list[dict[str, Any]] = []
+    fixed_latencies_s: list[float] = []
 
     print(f"Selected captures: {[int(row['capture_id']) for row in selected]}")
     print(f"Shared fixed noise: shape={noise_shape} seed={args.noise_seed} checksum={fixed_noise_checksum}")
@@ -736,13 +921,17 @@ def main(argv: list[str] | None = None) -> int:
         capture_id = int(metadata["capture_id"])
         batch = batches[capture_id]
         horizon = live_chunks[capture_id].shape[0]
-        fixed = execute_condition(
-            policy=policy,
-            frozen_batch=batch,
-            postprocessor=postprocessor,
-            device=device,
-            num_runs=args.fixed_runs_per_capture,
-            fixed_noise=fixed_noise,
+        fixed = (
+            sequential_rtc_results[capture_id]
+            if sequential_rtc_results is not None
+            else execute_condition(
+                policy=policy,
+                frozen_batch=batch,
+                postprocessor=postprocessor,
+                device=device,
+                num_runs=args.fixed_runs_per_capture,
+                fixed_noise=fixed_noise,
+            )
         )
         random = execute_condition(
             policy=policy,
@@ -754,6 +943,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if fixed.noise_checksum != fixed_noise_checksum:
             raise RuntimeError(f"Fixed-noise fairness checksum failed for capture {capture_id}")
+        fixed_latencies_s.extend(fixed.latencies_s)
         fixed_robot = fixed.robot_actions[:, :horizon, :action_dimension]
         random_robot = random.robot_actions[:, :horizon, :action_dimension]
         fixed_chunks[capture_id] = fixed_robot[0]
@@ -912,6 +1102,19 @@ def main(argv: list[str] | None = None) -> int:
         "fixed_noise_seed": args.noise_seed,
         "fixed_noise_checksum": fixed_noise_checksum,
         "fixed_noise_reused_for_every_capture": True,
+        "rtc": {
+            "enabled": args.rtc_enabled,
+            "mode": args.rtc_mode,
+            "execution_horizon": args.rtc_execution_horizon,
+            "max_guidance_weight": args.rtc_max_guidance_weight,
+            "prefix_attention_schedule": args.rtc_prefix_attention_schedule,
+            "first_capture_bypasses_rtc": True,
+            "sequence_is_temporally_threaded": args.rtc_enabled,
+        },
+        "inference_latency": _latency_summary(
+            fixed_latencies_s,
+            runway_s=(0.5 * 50 / args.fps),
+        ),
         "fixed_runs_per_capture": args.fixed_runs_per_capture,
         "fixed_noise_deterministic_all": all(
             row["fixed_repeat_max_abs_diff"] <= args.determinism_atol
