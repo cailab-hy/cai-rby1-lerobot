@@ -50,6 +50,7 @@ from lerobot.types import PolicyAction
 
 from .configs import PolicyServerConfig
 from .constants import SUPPORTED_POLICIES
+from .diagnostic_capture import PolicyBatchCaptureWriter
 from .frozen_noise_analysis import clone_to_cpu
 from .helpers import (
     FPSTracker,
@@ -83,6 +84,15 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.last_processed_obs = None
         self._frozen_batch_dump_lock = threading.Lock()
         self._frozen_batch_dumped = False
+        self._diagnostic_capture = (
+            PolicyBatchCaptureWriter(
+                config.diagnostic_capture_dir,
+                config.diagnostic_capture_max,
+                self.logger,
+            )
+            if config.diagnostic_capture_policy_batches
+            else None
+        )
 
         # Attributes will be set by SendPolicyInstructions
         self.device = None
@@ -93,6 +103,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy = None
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
+        self.pretrained_name_or_path: str | None = None
 
     @property
     def running(self):
@@ -153,6 +164,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy_type = policy_specs.policy_type  # act, pi0, etc.
         self.lerobot_features = policy_specs.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk
+        self.pretrained_name_or_path = policy_specs.pretrained_name_or_path
         self.timing_diagnostics = getattr(policy_specs, "timing_diagnostics", False)
         if self.timing_diagnostics:
             self.logger.info("[TIMING] Server diagnostics enabled by client policy setup")
@@ -452,6 +464,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         5. Convert to TimedAction list
         """
         """1. Prepare observation"""
+        diagnostic_request_kind = (
+            "initial" if self.last_processed_obs is None else "refill"
+        ) if self._diagnostic_capture is not None else None
         start_prepare = time.perf_counter()
         observation: Observation = raw_observation_to_observation(
             observation_t.get_observation(),
@@ -474,10 +489,42 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 observation, timestep=observation_t.get_timestep()
             )
 
+        prepared_capture = None
+        if self._diagnostic_capture is not None:
+            task = observation.get("task")
+            if isinstance(task, (list, tuple)) and len(task) == 1:
+                task = task[0]
+            if not isinstance(task, (str, int, float, bool, type(None))):
+                task = repr(task)
+            prepared_capture = self._diagnostic_capture.prepare(
+                observation,
+                {
+                    "wall_time": time.time(),
+                    "policy_timestamp": observation_t.get_timestamp(),
+                    "timestep": observation_t.get_timestep(),
+                    "must_go": observation_t.must_go,
+                    "request_kind": diagnostic_request_kind,
+                    "initial_request": diagnostic_request_kind == "initial",
+                    "refill_request": diagnostic_request_kind == "refill",
+                    # The client execution queue is not transported to the
+                    # server; report that explicitly instead of guessing.
+                    "queue_size": None,
+                    "executed_timestep": None,
+                    "server_observation_queue_size": self.observation_queue.qsize(),
+                    "task": task,
+                    "checkpoint": self.pretrained_name_or_path,
+                    "num_steps": getattr(self.policy.config, "num_steps", None),
+                    "fps": self.config.fps,
+                    "actions_per_chunk": self.actions_per_chunk,
+                },
+            )
+
         """3. Get action chunk"""
+        inference_start_wall_time = time.time() if prepared_capture is not None else None
         start_inference = time.perf_counter()
         action_tensor = self._get_action_chunk(observation)
         inference_time = time.perf_counter() - start_inference
+        inference_end_wall_time = time.time() if prepared_capture is not None else None
         self.logger.info(
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
         )
@@ -488,6 +535,15 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # So we process each action in the chunk individually
         start_postprocess = time.perf_counter()
         _, chunk_size, _ = action_tensor.shape
+        raw_capture_clone_started = time.perf_counter() if prepared_capture is not None else 0.0
+        raw_action_tensor_for_capture = None
+        if prepared_capture is not None:
+            raw_action_tensor_for_capture = action_tensor.squeeze(0).detach().clone()
+        raw_capture_clone_ms = (
+            (time.perf_counter() - raw_capture_clone_started) * 1000
+            if prepared_capture is not None
+            else 0.0
+        )
 
         # Process each action in the chunk
         processed_actions = []
@@ -498,10 +554,23 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             processed_actions.append(processed_action)
 
         # Stack back to (B, chunk_size, action_dim), then remove batch dim
-        action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
+        robot_action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
+        action_tensor = robot_action_tensor
         self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
 
         action_tensor = action_tensor.detach().cpu()
+        if prepared_capture is not None:
+            self._diagnostic_capture.submit(
+                prepared_capture,
+                raw_action_tensor_for_capture,
+                action_tensor,
+                {
+                    "inference_start_time": inference_start_wall_time,
+                    "inference_end_time": inference_end_wall_time,
+                    "inference_latency_ms": inference_time * 1000,
+                    "raw_preserve_clone_ms": raw_capture_clone_ms,
+                },
+            )
         policy_postprocess_end = time.perf_counter() if timing is not None else 0.0
 
         """5. Convert to TimedAction list"""
@@ -541,6 +610,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     def stop(self):
         """Stop the server"""
         self._reset_server()
+        if self._diagnostic_capture is not None:
+            self._diagnostic_capture.close()
         self.logger.info("Server stopping...")
 
 
@@ -564,7 +635,10 @@ def serve(cfg: PolicyServerConfig):
     policy_server.logger.info(f"PolicyServer started on {cfg.host}:{cfg.port}")
     server.start()
 
-    server.wait_for_termination()
+    try:
+        server.wait_for_termination()
+    finally:
+        policy_server.stop()
 
     policy_server.logger.info("Server terminated")
 

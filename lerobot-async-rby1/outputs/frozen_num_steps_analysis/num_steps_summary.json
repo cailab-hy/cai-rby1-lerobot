@@ -1,0 +1,137 @@
+{
+  "checkpoint": "/home/cai/rby1-lerobot/cai-rby1-lerobot/outputs/smolVLA_bs32_ViT_VLM_expert/checkpoints/020000/pretrained_model",
+  "frozen_batch": "/home/cai/frozen_smolvla_batch.pt",
+  "device": "cuda",
+  "num_steps": [
+    10,
+    20,
+    40
+  ],
+  "runs_per_step": 3,
+  "warmup_runs_per_step": 1,
+  "chunk_size": 50,
+  "max_action_dim": 32,
+  "actual_action_dim": 16,
+  "groups": {
+    "right_arm": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "left_arm": [
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13
+    ],
+    "gripper": [
+      14,
+      15
+    ],
+    "arms": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13
+    ]
+  },
+  "oscillation_threshold": 0.005,
+  "checkpoint_compile_model": false,
+  "runtime_compile_model": false,
+  "sample_actions_torch_compiled": false,
+  "rtc_enabled": false,
+  "fixed_noise_source": "generated once with seed=0",
+  "fixed_noise_checksum": "c245b2e4494e200c6d3e122467bff722023ebc6767af27d697749f8f8e3c7b1f",
+  "fixed_noise_checksums_by_step": {
+    "10": "c245b2e4494e200c6d3e122467bff722023ebc6767af27d697749f8f8e3c7b1f",
+    "20": "c245b2e4494e200c6d3e122467bff722023ebc6767af27d697749f8f8e3c7b1f",
+    "40": "c245b2e4494e200c6d3e122467bff722023ebc6767af27d697749f8f8e3c7b1f"
+  },
+  "frozen_checksum_before": "502dbee56bb203d97068207b0a197417cb836ebf309ba403e066d3565e2e1967",
+  "frozen_checksum_after": "502dbee56bb203d97068207b0a197417cb836ebf309ba403e066d3565e2e1967",
+  "frozen_checksums_by_step": {
+    "10": "502dbee56bb203d97068207b0a197417cb836ebf309ba403e066d3565e2e1967",
+    "20": "502dbee56bb203d97068207b0a197417cb836ebf309ba403e066d3565e2e1967",
+    "40": "502dbee56bb203d97068207b0a197417cb836ebf309ba403e066d3565e2e1967"
+  },
+  "frozen_unchanged": true,
+  "latency_ms": {
+    "10": {
+      "mean": 114.5415566667604,
+      "median": 114.75014600000577,
+      "p90": 115.20495800214121,
+      "p95": 115.26180950240814,
+      "p99": 115.30729070262169,
+      "min": 113.55586299760034,
+      "max": 115.31866100267507
+    },
+    "20": {
+      "mean": 210.4325753316516,
+      "median": 210.15201700356556,
+      "p90": 211.04050819849363,
+      "p95": 211.15156959785963,
+      "p99": 211.24041871735244,
+      "min": 209.8830779941636,
+      "max": 211.26263099722564
+    },
+    "40": {
+      "mean": 405.17462633336737,
+      "median": 404.29823999875225,
+      "p90": 407.8370511997491,
+      "p95": 408.2794025998737,
+      "p99": 408.6332837199734,
+      "min": 402.5038850013516,
+      "max": 408.7217539999983
+    }
+  },
+  "latency_multiplier_vs_first_condition": {
+    "10": 1.0,
+    "20": 1.8371723019608523,
+    "40": 3.5373591744711095
+  },
+  "interpretation": {
+    "classification": "MIXED_OR_MODEST_CHANGE",
+    "text": "The num_steps effect is mixed or modest; the raw roughness metrics do not support a strong attribution to Euler resolution alone.",
+    "ordered_steps": [
+      10,
+      20,
+      40
+    ],
+    "delta_p95": [
+      0.04250787794589995,
+      0.0439354807138443,
+      0.04537029266357418
+    ],
+    "second_delta_p95": [
+      0.047820198535919185,
+      0.04087053686380386,
+      0.04288578629493713
+    ],
+    "mean_arm_oscillation": [
+      0.602061556329849,
+      0.614017521902378,
+      0.6503267973856209
+    ],
+    "delta_p95_reduction": -0.06733845244679697,
+    "second_delta_p95_reduction": 0.10318677864282952,
+    "mean_arm_oscillation_reduction": -0.08016662174877184,
+    "heuristic": "significant requires monotonic >=20% reductions in both robot-unit arm second-delta p95 and mean arm oscillation; little/no change requires delta p95, second-delta p95, and oscillation absolute reductions all <5%"
+  }
+}

@@ -1,0 +1,13 @@
+question,answer,metric,value
+Q1,YES,random_across_run_mean_std,0.01955074700701516
+Q1,YES,fixed_across_run_mean_std,0.0
+Q1,YES,random_to_fixed_std_ratio,88048736935608.31
+Q1,YES,required_ratio,10.0
+Q2,YES,fixed_arm_delta_p95,0.05378267914056778
+Q2,YES,delta_threshold,0.005
+Q2,YES,fixed_arm_second_delta_p95,0.05283474922180176
+Q2,YES,second_delta_threshold,0.005
+Q3,NO,fixed_across_run_max_std,0.0
+Q3,NO,determinism_atol,1e-06
+PRIMARY,B,interpretation,"The fixed-noise trajectory remains temporally rough; prioritize dataset trajectory quality, training, and temporal regularization."
+SECONDARY,1,finding,A: Random sampling also contributes substantial chunk-to-chunk variability.

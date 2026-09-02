@@ -104,6 +104,21 @@ class PolicyServerConfig:
         },
     )
 
+    # Optional multi-observation diagnostic. Disabled by default so the
+    # production inference path does not clone tensors or create a writer.
+    diagnostic_capture_policy_batches: bool = field(
+        default=False,
+        metadata={"help": "Capture every policy-ready batch and generated action chunk"},
+    )
+    diagnostic_capture_dir: str = field(
+        default="outputs/near_grasp_capture",
+        metadata={"help": "Directory for policy batch/chunk diagnostic captures"},
+    )
+    diagnostic_capture_max: int = field(
+        default=50,
+        metadata={"help": "Maximum diagnostic captures per policy-server process"},
+    )
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.port < 1 or self.port > 65535:
@@ -117,6 +132,12 @@ class PolicyServerConfig:
 
         if self.obs_queue_timeout < 0:
             raise ValueError(f"obs_queue_timeout must be non-negative, got {self.obs_queue_timeout}")
+
+        if self.diagnostic_capture_max <= 0:
+            raise ValueError(
+                "diagnostic_capture_max must be positive, "
+                f"got {self.diagnostic_capture_max}"
+            )
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "PolicyServerConfig":
