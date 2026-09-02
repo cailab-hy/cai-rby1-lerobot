@@ -37,7 +37,7 @@ lerobot-robot-client \
     }
   }' \
   --policy_type=smolvla \
-  --pretrained_name_or_path=/home/cai/rby1-lerobot/cai-rby1-lerobot/outputs/smolVLA_bs32_ViT_VLM_expert/checkpoints/020000/pretrained_model \
+  --pretrained_name_or_path=/home/cai/rby1-lerobot/cai-rby1-lerobot/outputs/smolVLA_bs32_ViT_VLM_expert_left_only/checkpoints/040000/pretrained_model \
   --policy_device=cuda \
   --client_device=cpu \
   --actions_per_chunk=50 \
@@ -46,8 +46,7 @@ lerobot-robot-client \
   --task="Pick up the bowl and place it in the box." \
   --fps=15 \
   --image_resize_scale=1.0 \
-  --jpeg_compression=true \
-  --timing_diagnostics=true
+  --jpeg_compression=true
 
 # Pick up the bowl and place it in the box.
 # Pick up the cup and place it in the box.
