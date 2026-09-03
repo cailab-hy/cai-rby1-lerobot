@@ -22,7 +22,7 @@ from .frozen_noise_analysis import (
     nested_checksum,
     postprocess_action_chunk,
 )
-from .rtc import latency_to_delay_frames
+from .rtc import RollingLatencyEstimator
 
 
 PERCENTILES = (0.50, 0.90, 0.95, 0.99)
@@ -658,7 +658,7 @@ def execute_sequential_rtc_condition(
         policy.reset()
         previous_raw: torch.Tensor | None = None
         previous_metadata: dict[str, Any] | None = None
-        measured_latencies: list[float] = []
+        delay_estimator = RollingLatencyEstimator()
         for metadata in selected:
             capture_id = int(metadata["capture_id"])
             batch = clone_to_device(batches[capture_id], device)
@@ -670,11 +670,17 @@ def execute_sequential_rtc_condition(
                 shift, _, _, _ = estimate_frame_shift(previous_metadata, metadata, fps)
                 if shift is not None and shift < previous_raw.shape[0]:
                     prefix = previous_raw[shift:].detach().clone()
-            delay, _ = latency_to_delay_frames(max(measured_latencies, default=0.0), fps)
-            if _run > 0:
+            delay_estimate = delay_estimator.estimate_delay_frames(fps)
+            delay = delay_estimate[0] if delay_estimate is not None else 0
+            if _run > 0 and delay_estimate is not None:
                 delay = reference_delays[capture_id]
             kwargs: dict[str, Any] = {}
-            if prefix is not None and prefix.shape[0] > 0 and bool(torch.isfinite(prefix).all()):
+            if (
+                delay_estimate is not None
+                and prefix is not None
+                and prefix.shape[0] > 0
+                and bool(torch.isfinite(prefix).all())
+            ):
                 kwargs = {
                     "inference_delay": delay,
                     "prev_chunk_left_over": prefix,
@@ -689,7 +695,10 @@ def execute_sequential_rtc_condition(
             raw = policy.predict_action_chunk(batch, noise=noise_i, **kwargs)
             _synchronize(device)
             elapsed = time.perf_counter() - started
-            measured_latencies.append(elapsed)
+            # The first inference is a cold start. Begin collecting latency
+            # only after a previous chunk exists, matching the live server.
+            if previous_raw is not None:
+                delay_estimator.add(elapsed)
             if _run == 0:
                 reference_delays[capture_id] = delay
 

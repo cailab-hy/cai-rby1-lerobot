@@ -677,6 +677,15 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                     rtc_request.inference_delay_frames if rtc_request else 0
                 ),
                 "delay_frames_float": rtc_request.delay_frames_float if rtc_request else 0.0,
+                "delay_estimator_ready": bool(
+                    rtc_request and rtc_request.delay_estimator_ready
+                ),
+                "delay_estimator_window_count": (
+                    rtc_request.delay_estimator_window_count if rtc_request else 0
+                ),
+                "delay_estimator_window_max_ms": (
+                    rtc_request.delay_estimator_window_max_ms if rtc_request else None
+                ),
                 "prev_leftover_count": (
                     int(rtc_request.prefix.shape[0])
                     if rtc_request is not None and rtc_request.prefix is not None
@@ -688,7 +697,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self.logger.info(
                 "[RTC] enabled=True mode=%s execution_horizon=%d max_guidance_weight=%.1f "
                 "schedule=%s inference_latency_ms=%.3f inference_delay_frames=%d "
-                "delay_frames_float=%.3f prev_chunk_left_over_length=%d rtc_applied=%s",
+                "delay_frames_float=%.3f delay_estimator_ready=%s "
+                "delay_estimator_window_count=%d delay_estimator_window_max_ms=%s "
+                "prev_chunk_left_over_length=%d rtc_applied=%s rtc_bypass_reason=%s",
                 self.rtc_mode,
                 self.rtc_execution_horizon,
                 self.rtc_max_guidance_weight,
@@ -696,8 +707,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 inference_time * 1000,
                 record["inference_delay_frames"],
                 record["delay_frames_float"],
+                record["delay_estimator_ready"],
+                record["delay_estimator_window_count"],
+                record["delay_estimator_window_max_ms"],
                 record["prev_leftover_count"],
                 record["rtc_applied"],
+                record["rtc_bypass_reason"],
             )
             if self._rtc_diagnostics is not None:
                 self._rtc_diagnostics.write(record)

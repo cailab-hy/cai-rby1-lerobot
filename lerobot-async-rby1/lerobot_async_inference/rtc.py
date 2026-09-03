@@ -6,6 +6,7 @@ import json
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +16,7 @@ import torch
 
 
 SUPPORTED_RTC_MODE = "guided"
+DEFAULT_DELAY_ESTIMATOR_WINDOW_SIZE = 10
 
 
 def latency_to_delay_frames(latency_s: float, fps: float) -> tuple[int, float]:
@@ -25,6 +27,39 @@ def latency_to_delay_frames(latency_s: float, fps: float) -> tuple[int, float]:
         raise ValueError(f"fps must be finite and positive, got {fps}")
     frames_float = latency_s * fps
     return math.ceil(frames_float), frames_float
+
+
+class RollingLatencyEstimator:
+    """Estimate RTC delay from the maximum of a bounded recent-latency window."""
+
+    def __init__(self, window_size: int = DEFAULT_DELAY_ESTIMATOR_WINDOW_SIZE) -> None:
+        if not isinstance(window_size, int) or isinstance(window_size, bool) or window_size <= 0:
+            raise ValueError(f"window_size must be a positive integer, got {window_size}")
+        self._latencies_s: deque[float] = deque(maxlen=window_size)
+
+    @property
+    def ready(self) -> bool:
+        return bool(self._latencies_s)
+
+    @property
+    def window_count(self) -> int:
+        return len(self._latencies_s)
+
+    @property
+    def window_max_s(self) -> float | None:
+        return max(self._latencies_s) if self._latencies_s else None
+
+    def add(self, latency_s: float) -> None:
+        if not math.isfinite(latency_s) or latency_s < 0:
+            raise ValueError(f"latency_s must be finite and non-negative, got {latency_s}")
+        self._latencies_s.append(float(latency_s))
+
+    def estimate_delay_frames(self, fps: float) -> tuple[int, float] | None:
+        """Return the rolling-max delay, or ``None`` until one sample is available."""
+        latency_s = self.window_max_s
+        if latency_s is None:
+            return None
+        return latency_to_delay_frames(latency_s, fps)
 
 
 def slice_previous_policy_chunk(
@@ -100,17 +135,25 @@ class RTCRequest:
     delay_frames_float: float
     applied: bool
     bypass_reason: str | None
+    delay_estimator_ready: bool = False
+    delay_estimator_window_count: int = 0
+    delay_estimator_window_max_ms: float | None = None
 
 
 class RTCState:
     """Per-client state needed to connect consecutive asynchronous policy requests."""
 
-    def __init__(self, fps: float):
+    def __init__(
+        self,
+        fps: float,
+        latency_window_size: int = DEFAULT_DELAY_ESTIMATOR_WINDOW_SIZE,
+    ) -> None:
         self.fps = fps
         self.previous_raw_chunk: torch.Tensor | None = None
         self.previous_robot_chunk: torch.Tensor | None = None
         self.previous_timestep: int | None = None
-        self.latencies_s: list[float] = []
+        self.delay_estimator = RollingLatencyEstimator(latency_window_size)
+        self._completed_inference_count = 0
 
     def prepare(self, current_timestep: int) -> RTCRequest:
         raw_leftover, shift = slice_previous_policy_chunk(
@@ -119,15 +162,18 @@ class RTCState:
         robot_leftover, _ = slice_previous_policy_chunk(
             self.previous_robot_chunk, self.previous_timestep, current_timestep
         )
-        predicted_latency = max(self.latencies_s, default=0.0)
-        delay, delay_float = latency_to_delay_frames(predicted_latency, self.fps)
+        delay_estimate = self.delay_estimator.estimate_delay_frames(self.fps)
+        delay, delay_float = delay_estimate if delay_estimate is not None else (0, 0.0)
         reason = None
         if raw_leftover is None:
-            reason = "no previous chunk"
+            reason = "no_previous_chunk"
         elif raw_leftover.shape[0] == 0:
-            reason = "previous chunk exhausted"
+            reason = "previous_chunk_exhausted"
         elif not bool(torch.isfinite(raw_leftover).all()):
-            reason = "previous chunk contains NaN or Inf"
+            reason = "previous_chunk_non_finite"
+        elif delay_estimate is None:
+            reason = "delay_estimator_warmup"
+        window_max_s = self.delay_estimator.window_max_s
         return RTCRequest(
             prefix=None if reason else raw_leftover,
             previous_robot_leftover=robot_leftover,
@@ -136,6 +182,11 @@ class RTCState:
             delay_frames_float=delay_float,
             applied=reason is None,
             bypass_reason=reason,
+            delay_estimator_ready=self.delay_estimator.ready,
+            delay_estimator_window_count=self.delay_estimator.window_count,
+            delay_estimator_window_max_ms=(
+                window_max_s * 1000 if window_max_s is not None else None
+            ),
         )
 
     def complete(
@@ -146,10 +197,15 @@ class RTCState:
         timestep: int,
         latency_s: float,
     ) -> None:
+        # The first completed inference is a cold start. It establishes the
+        # previous chunk only and must never influence RTC delay estimation.
+        is_cold_start = self._completed_inference_count == 0
         self.previous_raw_chunk = raw_chunk.detach().clone()
         self.previous_robot_chunk = robot_chunk.detach().clone()
         self.previous_timestep = timestep
-        self.latencies_s.append(latency_s)
+        if not is_cold_start:
+            self.delay_estimator.add(latency_s)
+        self._completed_inference_count += 1
 
 
 class RTCDiagnosticsWriter:
