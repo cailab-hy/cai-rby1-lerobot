@@ -586,6 +586,20 @@ class Rby1(Robot):
 
         return obs
 
+    def get_joint_positions(self) -> dict[str, float]:
+        """Read command-space joint positions without waiting for cameras.
+
+        This lightweight API is used to seed and diagnose high-rate trajectory
+        post-processing. Arm values are radians. Grippers are intentionally
+        omitted because their serial-bus read would block the command loop.
+        """
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+        state = self._robot.get_state()
+        measured: dict[str, float] = {}
+        self._read_group(measured, state.position, self._model, "")
+        return measured
+
     def _read_group(
         self, obs: dict[str, Any], values: np.ndarray, model: Any, suffix: str
     ) -> None:

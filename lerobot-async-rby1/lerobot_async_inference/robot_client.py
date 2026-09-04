@@ -76,6 +76,7 @@ from typing import Any
 
 import draccus
 import grpc
+import numpy as np
 import torch
 
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
@@ -116,6 +117,7 @@ from .policy.pi05_zmq import (
 
 from .camera_image_logger import CameraImageWriter
 from .configs import RobotClientConfig, cosine_ramp, cosine_ramp_alpha
+from .diagnostic_logger import AsyncJSONLWriter
 from .helpers import (
     Action,
     FPSTracker,
@@ -129,6 +131,12 @@ from .helpers import (
     visualize_action_queue_size,
 )
 from .image_transport import JPEG_QUALITY, encode_observation_images
+from .trajectory import GripperPostprocessor, JerkLimitedTrajectory
+from .urdf_limits import (
+    build_operational_profile,
+    load_active_urdf_limits,
+    validate_arm_action_map,
+)
 
 LOG_RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -171,6 +179,50 @@ class RobotClient:
         # Store configuration
         self.config = config
         self.robot = make_robot_from_config(config.robot)
+        if config.trajectory_postprocess.enabled:
+            trajectory_cfg = config.trajectory_postprocess
+            if trajectory_cfg.limits_source == "active_urdf":
+                configured_model = str(getattr(config.robot, "model", "auto")).lower()
+                active_model = str(trajectory_cfg.active_model).lower()
+                if configured_model != "auto" and configured_model != active_model:
+                    raise ValueError(
+                        "trajectory_postprocess active_model disagrees with robot.model: "
+                        f"{trajectory_cfg.active_model!r} != {configured_model!r}"
+                    )
+                validate_arm_action_map(self.robot.action_features)
+                urdf_limits = load_active_urdf_limits(
+                    Path(trajectory_cfg.sdk_models_dir),
+                    trajectory_cfg.active_model,
+                    trajectory_cfg.urdf_version,
+                )
+                profile = build_operational_profile(trajectory_cfg.profile, urdf_limits)
+                trajectory_cfg.arms.position_limits = profile.position_limits
+                trajectory_cfg.arms.velocity_limits = profile.velocity_limits
+                trajectory_cfg.arms.acceleration_limits = profile.acceleration_limits
+                trajectory_cfg.arms.jerk_limits = profile.jerk_limits
+                self.logger.info(
+                    "Loaded trajectory limits from %s (sha256=%s, profile=%s)",
+                    urdf_limits.path,
+                    urdf_limits.sha256,
+                    profile.name,
+                )
+            arm_names = [name for name in self.robot.action_features if "_arm_" in name]
+            limit_maps = {
+                "position": config.trajectory_postprocess.arms.position_limits,
+                "velocity": config.trajectory_postprocess.arms.velocity_limits,
+                "acceleration": config.trajectory_postprocess.arms.acceleration_limits,
+                "jerk": config.trajectory_postprocess.arms.jerk_limits,
+            }
+            incomplete = {
+                label: [name for name in arm_names if name not in values]
+                for label, values in limit_maps.items()
+                if any(name not in values for name in arm_names)
+            }
+            if not arm_names or incomplete:
+                raise ValueError(
+                    "trajectory_postprocess cannot be enabled without explicit limits for every "
+                    f"arm action; missing={incomplete or 'arm joint-mode features'}"
+                )
         self.robot.connect()
         self.camera_keys = tuple(self.robot.cameras.keys())
         self.backend = getattr(config, "backend", "grpc")
@@ -268,6 +320,55 @@ class RobotClient:
         self._refill_request_queue_ratio = None
         self.action_queue_size = []
         self.start_barrier = threading.Barrier(2)  # 2 threads: action receiver, control loop
+
+        trajectory_cfg = config.trajectory_postprocess
+        self._chunk_counter = 0
+        self._diagnostic_sample_counter = 0
+        self._action_diagnostic_writer = (
+            AsyncJSONLWriter(
+                trajectory_cfg.logging.path,
+                max_queue_size=trajectory_cfg.logging.max_queue_size,
+            )
+            if trajectory_cfg.logging.enabled
+            else None
+        )
+        # Preserve the legacy final_actions JSONL schema while moving its disk
+        # IO off the real-time path.
+        self._final_action_writer = AsyncJSONLWriter(FINAL_ACTION_LOG)
+        self._trajectory: JerkLimitedTrajectory | None = None
+        self._gripper_postprocessor: GripperPostprocessor | None = None
+        self._trajectory_target: TimedAction | None = None
+        self._trajectory_last_tick: float | None = None
+        self._last_sent_action: dict[str, float] | None = None
+        self._measured_position_reason: str | None = None
+        if trajectory_cfg.enabled:
+            feature_names = list(self.robot.action_features)
+            arm_names = [name for name in feature_names if "_arm_" in name]
+            gripper_names = [name for name in feature_names if "_gripper_" in name]
+            if not arm_names:
+                raise ValueError(
+                    "trajectory_postprocess requires joint-mode arm action features"
+                )
+            self._trajectory = JerkLimitedTrajectory(
+                arm_names,
+                trajectory_cfg.arms.velocity_limits,
+                trajectory_cfg.arms.acceleration_limits,
+                trajectory_cfg.arms.jerk_limits,
+                trajectory_cfg.arms.position_limits,
+            )
+            self._gripper_postprocessor = GripperPostprocessor(
+                gripper_names,
+                trajectory_cfg.grippers.mode,
+                trajectory_cfg.grippers.rate_limits,
+            )
+            self.logger.info(
+                "Trajectory post-processing enabled: policy_rate=%sHz control_rate=%sHz "
+                "arms=%s grippers=%s",
+                config.fps,
+                trajectory_cfg.control_rate_hz,
+                arm_names,
+                trajectory_cfg.grippers.mode,
+            )
 
         # Diagnostic state is allocated only when explicitly requested. It contains
         # scalar timings and timestep metadata, never actions or observations.
@@ -377,6 +478,11 @@ class RobotClient:
         camera_image_writer = getattr(self, "camera_image_writer", None)
         if camera_image_writer is not None:
             camera_image_writer.close()
+
+        for writer_name in ("_action_diagnostic_writer", "_final_action_writer"):
+            writer = getattr(self, writer_name, None)
+            if writer is not None:
+                writer.close()
 
         self.robot.disconnect()
         self.logger.debug("Robot disconnected")
@@ -505,11 +611,107 @@ class RobotClient:
         self.logger.debug(f"Queue size: {queue_size}, Queue contents: {timestamps}")
         return queue_size, timestamps
 
+    @staticmethod
+    def _tensor_list(value: torch.Tensor | None) -> list[float] | None:
+        if value is None:
+            return None
+        return value.detach().cpu().flatten().tolist()
+
+    def _submit_diagnostic(self, record: dict[str, Any], *, downsample: bool = False) -> None:
+        writer = getattr(self, "_action_diagnostic_writer", None)
+        if writer is None:
+            return
+        if downsample:
+            self._diagnostic_sample_counter += 1
+            factor = self.config.trajectory_postprocess.logging.downsample
+            if (self._diagnostic_sample_counter - 1) % factor:
+                return
+        if not writer.submit(record) and writer.dropped_records in {1, 10, 100}:
+            self.logger.warning(
+                "Action diagnostic queue full; dropped_records=%d", writer.dropped_records
+            )
+
+    def _ingest_action_chunk(
+        self,
+        incoming_actions: list[TimedAction],
+        aggregate_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None,
+        *,
+        receive_wall_time: float | None = None,
+        receive_monotonic_time: float | None = None,
+        timing: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Attach one clock-domain mapping, discard stale work, then merge."""
+        receive_wall = time.time() if receive_wall_time is None else receive_wall_time
+        receive_mono = time.monotonic() if receive_monotonic_time is None else receive_monotonic_time
+        self._chunk_counter = getattr(self, "_chunk_counter", 0) + 1
+        chunk_id = self._chunk_counter
+        with self.action_queue_lock:
+            queue_depth_before = self.action_queue.qsize()
+
+        future: list[TimedAction] = []
+        stale = 0
+        for action in incoming_actions:
+            scheduled = receive_mono + (action.get_timestamp() - receive_wall)
+            metadata = dict(getattr(action, "metadata", {}) or {})
+            metadata.update(
+                chunk_id=chunk_id,
+                source_chunk_id=chunk_id,
+                absolute_timestep=action.get_timestep(),
+                scheduled_execution_time=scheduled,
+                scheduled_execution_wall_time=action.get_timestamp(),
+                chunk_received_monotonic_time=receive_mono,
+                chunk_received_wall_time=receive_wall,
+            )
+            metadata.setdefault("overlap_index", None)
+            metadata.setdefault("overlap_length", 0)
+            metadata.setdefault("cosine_alpha", None)
+            metadata.setdefault("old_action", None)
+            metadata.setdefault("new_action", self._tensor_list(action.get_action()))
+            metadata.setdefault("blended_action", self._tensor_list(action.get_action()))
+            metadata.setdefault("old_new_disagreement_norm", None)
+            action.metadata = metadata
+            if scheduled <= receive_mono:
+                stale += 1
+            else:
+                future.append(action)
+
+        merge_timing = timing if timing is not None else {}
+        self._aggregate_action_queues(
+            future,
+            aggregate_fn,
+            timing=merge_timing,
+            current_monotonic_time=receive_mono,
+        )
+        with self.action_queue_lock:
+            queue_depth_after = self.action_queue.qsize()
+        stale += int(merge_timing.get("stale_actions_dropped", 0))
+        first_metadata = (
+            getattr(incoming_actions[0], "metadata", {}) if incoming_actions else {}
+        )
+        record = {
+            "record_type": "chunk",
+            "chunk_id": chunk_id,
+            "source_observation_timestep": first_metadata.get(
+                "source_observation_timestep",
+                incoming_actions[0].get_timestep() if incoming_actions else None,
+            ),
+            "chunk_received_monotonic_time": receive_mono,
+            "chunk_received_wall_time": receive_wall,
+            "inference_start_time": first_metadata.get("inference_start_time"),
+            "inference_end_time": first_metadata.get("inference_end_time"),
+            "queue_depth_before": queue_depth_before,
+            "queue_depth_after": queue_depth_after,
+            "stale_actions_dropped": stale,
+        }
+        self._submit_diagnostic(record)
+        return record
+
     def _aggregate_action_queues(
         self,
         incoming_actions: list[TimedAction],
         aggregate_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
         timing: dict[str, Any] | None = None,
+        current_monotonic_time: float | None = None,
     ):
         """Merge queued and incoming future actions, aggregating matching timesteps."""
         diagnostics = timing is not None
@@ -530,11 +732,19 @@ class RobotClient:
             latest_action_tensor = getattr(self, "latest_action_tensor", None)
 
         merge_compute_start = time.perf_counter() if diagnostics else 0.0
+        stale_old = 0
         old_by_timestep = {
             action.get_timestep(): action
             for action in internal_queue
             if action.get_timestep() > latest_action
+            and not (
+                current_monotonic_time is not None
+                and (getattr(action, "metadata", {}) or {}).get("scheduled_execution_time")
+                is not None
+                and action.metadata["scheduled_execution_time"] <= current_monotonic_time
+            )
         }
+        stale_old = len(internal_queue) - len(old_by_timestep)
         incoming_by_timestep = {
             action.get_timestep(): action
             for action in incoming_actions
@@ -562,21 +772,45 @@ class RobotClient:
                 old_action = old_by_timestep[timestep]
                 new_action = incoming_by_timestep[timestep]
                 if use_cosine_ramp:
+                    overlap_index = overlap_index_by_timestep[timestep]
+                    overlap_count = len(overlap_timesteps)
                     aggregated_action = cosine_ramp(
                         old_action.get_action(),
                         new_action.get_action(),
-                        overlap_index=overlap_index_by_timestep[timestep],
-                        overlap_count=len(overlap_timesteps),
+                        overlap_index=overlap_index,
+                        overlap_count=overlap_count,
                     )
                 else:
                     aggregated_action = aggregate_fn(
                         old_action.get_action(), new_action.get_action()
                     )
+                metadata = dict(getattr(new_action, "metadata", {}) or {})
+                metadata.update(
+                    overlap_index=overlap_index_by_timestep[timestep],
+                    overlap_length=len(overlap_timesteps),
+                    cosine_alpha=(
+                        cosine_ramp_alpha(
+                            overlap_index_by_timestep[timestep], len(overlap_timesteps)
+                        )
+                        if use_cosine_ramp
+                        else None
+                    ),
+                    old_action=self._tensor_list(old_action.get_action()),
+                    new_action=self._tensor_list(new_action.get_action()),
+                    blended_action=self._tensor_list(aggregated_action),
+                    old_new_disagreement_norm=float(
+                        torch.linalg.vector_norm(
+                            old_action.get_action().detach().flatten()
+                            - new_action.get_action().detach().flatten()
+                        ).item()
+                    ),
+                )
                 future_action_queue.put(
                     TimedAction(
                         timestamp=new_action.get_timestamp(),
                         timestep=timestep,
                         action=aggregated_action,
+                        metadata=metadata,
                     )
                 )
         queue_rebuild_end = time.perf_counter() if diagnostics else 0.0
@@ -677,6 +911,7 @@ class RobotClient:
                 final_queue_size=len(final_timesteps),
                 final_queue_first_timestep=(final_timesteps[0] if final_timesteps else None),
                 final_queue_last_timestep=(final_timesteps[-1] if final_timesteps else None),
+                stale_actions_dropped=stale_old,
             )
 
     def _action_boundary_metrics(
@@ -740,6 +975,7 @@ class RobotClient:
                     continue  # received `Empty` from server, wait for next call
 
                 receive_time = time.time()
+                receive_monotonic_time = time.monotonic()
                 processing_start = time.perf_counter() if self.config.timing_diagnostics else 0.0
 
                 # Deserialize bytes back into list[TimedAction]
@@ -800,9 +1036,11 @@ class RobotClient:
                 # Update action queue
                 start_time = time.perf_counter()
                 aggregate_timing = {} if self.config.timing_diagnostics else None
-                self._aggregate_action_queues(
+                self._ingest_action_chunk(
                     timed_actions,
                     self.config.aggregate_fn,
+                    receive_wall_time=receive_time,
+                    receive_monotonic_time=receive_monotonic_time,
                     timing=aggregate_timing,
                 )
                 queue_update_time = time.perf_counter() - start_time
@@ -897,11 +1135,198 @@ class RobotClient:
     def actions_available(self):
         """Check if there are actions available in the queue"""
         with self.action_queue_lock:
-            return not self.action_queue.empty()
+            if self.action_queue.empty():
+                return False
+            metadata = getattr(self.action_queue.queue[0], "metadata", {}) or {}
+            scheduled = metadata.get("scheduled_execution_time")
+            return scheduled is None or scheduled <= time.monotonic()
 
     def _action_tensor_to_action_dict(self, action_tensor: torch.Tensor) -> dict[str, float]:
         action = {key: action_tensor[i].item() for i, key in enumerate(self.robot.action_features)}
         return action
+
+    def _read_measured_joint_positions(self) -> tuple[dict[str, float] | None, str | None]:
+        try:
+            reader = getattr(self.robot, "get_joint_positions", None)
+            measured = reader() if callable(reader) else self.robot.get_observation()
+            result = {
+                name: float(measured[name])
+                for name in self.robot.action_features
+                if name in measured and np.isfinite(float(measured[name]))
+            }
+            arm_names = self._trajectory.joint_names if self._trajectory is not None else ()
+            if all(name in result for name in arm_names):
+                return result, None
+            return None, "robot observation did not contain every commanded arm joint"
+        except Exception as exc:
+            return None, f"measured joint read unavailable: {type(exc).__name__}: {exc}"
+
+    def reset_trajectory(self, measured_position: dict[str, float] | None = None) -> bool:
+        """Reset post-processing from measured state after an episode reset."""
+        if self._trajectory is None:
+            return False
+        reason = None
+        if measured_position is None:
+            measured_position, reason = self._read_measured_joint_positions()
+        if measured_position is None and self._last_sent_action is not None:
+            measured_position = self._last_sent_action
+            reason = "measured position unavailable; seeded from last sent command"
+        if measured_position is None:
+            self._measured_position_reason = reason or "no measured or previously sent command available"
+            self.logger.error("Cannot reset trajectory: %s", self._measured_position_reason)
+            return False
+        try:
+            self._trajectory.reset(
+                [measured_position[name] for name in self._trajectory.joint_names]
+            )
+            if self._gripper_postprocessor is not None:
+                gripper_values = [
+                    measured_position.get(
+                        name,
+                        self._last_sent_action.get(name, 0.0)
+                        if self._last_sent_action
+                        else 0.0,
+                    )
+                    for name in self._gripper_postprocessor.joint_names
+                ]
+                self._gripper_postprocessor.reset(gripper_values)
+            self._trajectory_last_tick = time.monotonic()
+            self._measured_position_reason = reason
+            return True
+        except (KeyError, ValueError) as exc:
+            self._measured_position_reason = f"invalid reset position: {exc}"
+            self.logger.error("Cannot reset trajectory: %s", self._measured_position_reason)
+            return False
+
+    def _pop_due_waypoint(self, now_monotonic: float) -> tuple[TimedAction | None, int]:
+        """Consume due waypoints once, returning only the newest after a stall."""
+        due: list[TimedAction] = []
+        with self.action_queue_lock:
+            while not self.action_queue.empty():
+                candidate = self.action_queue.queue[0]
+                scheduled = (getattr(candidate, "metadata", {}) or {}).get(
+                    "scheduled_execution_time", now_monotonic
+                )
+                if scheduled > now_monotonic:
+                    break
+                due.append(self.action_queue.get_nowait())
+        if not due:
+            return None, 0
+        newest = due[-1]
+        dropped = len(due) - 1
+        if dropped:
+            self.logger.warning(
+                "Control loop missed %d policy waypoints; dropped them without catch-up burst",
+                dropped,
+            )
+        return newest, dropped
+
+    def control_loop_trajectory_action(self, now_monotonic: float | None = None) -> dict[str, Any] | None:
+        """Generate and send at most one high-rate command for this control tick."""
+        if self._trajectory is None:
+            raise RuntimeError("trajectory post-processing is disabled")
+        now = time.monotonic() if now_monotonic is None else now_monotonic
+        waypoint, delayed_drops = self._pop_due_waypoint(now)
+        if waypoint is not None:
+            self._trajectory_target = waypoint
+            with self.latest_action_lock:
+                self.latest_action = waypoint.get_timestep()
+                self.latest_action_tensor = waypoint.get_action()
+        if self._trajectory_target is None:
+            return None
+        if not self._trajectory.initialized and not self.reset_trajectory():
+            return None
+
+        nominal_dt = 1.0 / self.config.trajectory_postprocess.control_rate_hz
+        dt = nominal_dt if self._trajectory_last_tick is None else now - self._trajectory_last_tick
+        if dt <= 0:
+            dt = nominal_dt
+        self._trajectory_last_tick = now
+        target_action = self._action_tensor_to_action_dict(self._trajectory_target.get_action())
+        trajectory_error = None
+        if waypoint is not None:
+            try:
+                self._trajectory.set_target(
+                    [target_action[name] for name in self._trajectory.joint_names]
+                )
+            except (KeyError, ValueError) as exc:
+                trajectory_error = f"invalid target: {exc}"
+
+        sample = (
+            self._trajectory.hold_last_valid(trajectory_error, dt)
+            if trajectory_error is not None
+            else self._trajectory.step(dt)
+        )
+        limited_action = dict(target_action)
+        for index, name in enumerate(self._trajectory.joint_names):
+            limited_action[name] = float(sample.position[index])
+
+        gripper = self._gripper_postprocessor
+        if gripper is not None and waypoint is not None and gripper.joint_names:
+            gripper_position = gripper.update(
+                [target_action[name] for name in gripper.joint_names], dt
+            )
+            for index, name in enumerate(gripper.joint_names):
+                limited_action[name] = float(gripper_position[index])
+        elif gripper is not None and gripper.position is not None:
+            for index, name in enumerate(gripper.joint_names):
+                limited_action[name] = float(gripper.position[index])
+
+        measured, measured_reason = self._read_measured_joint_positions()
+        actual_send_monotonic = time.monotonic()
+        actual_send_wall = time.time()
+        performed = self.robot.send_action(limited_action)
+        self._last_sent_action = dict(limited_action)
+
+        final_record = {
+            "wall_time": actual_send_wall,
+            "policy_timestamp": self._trajectory_target.get_timestamp(),
+            "timestep": self._trajectory_target.get_timestep(),
+            "action": limited_action,
+        }
+        self._final_action_writer.submit(final_record)
+
+        metadata = getattr(self._trajectory_target, "metadata", {}) or {}
+        velocity = {name: float(sample.velocity[i]) for i, name in enumerate(self._trajectory.joint_names)}
+        acceleration = {
+            name: float(sample.acceleration[i]) for i, name in enumerate(self._trajectory.joint_names)
+        }
+        jerk = {name: float(sample.jerk[i]) for i, name in enumerate(self._trajectory.joint_names)}
+        tracking_error = (
+            {name: measured[name] - limited_action[name] for name in self._trajectory.joint_names}
+            if measured is not None
+            else None
+        )
+        self._submit_diagnostic(
+            {
+                "record_type": "action",
+                "wall_timestamp": actual_send_wall,
+                "monotonic_timestamp": actual_send_monotonic,
+                "absolute_timestep": self._trajectory_target.get_timestep(),
+                "scheduled_execution_time": metadata.get("scheduled_execution_time"),
+                "actual_send_time": actual_send_monotonic,
+                "source_chunk_id": metadata.get("source_chunk_id"),
+                "overlap_index": metadata.get("overlap_index"),
+                "overlap_length": metadata.get("overlap_length", 0),
+                "cosine_alpha": metadata.get("cosine_alpha"),
+                "old_action": metadata.get("old_action"),
+                "new_action": metadata.get("new_action"),
+                "blended_action": metadata.get("blended_action"),
+                "limited_action": limited_action,
+                "old_new_disagreement_norm": metadata.get("old_new_disagreement_norm"),
+                "command_velocity": velocity,
+                "command_acceleration": acceleration,
+                "command_jerk": jerk,
+                "measured_joint_position": measured,
+                "measured_joint_position_reason": measured_reason,
+                "position_tracking_error": tracking_error,
+                "stale_actions_dropped": delayed_drops,
+                "trajectory_valid": sample.valid,
+                "trajectory_error": sample.error,
+            },
+            downsample=True,
+        )
+        return performed
 
     def _emit_action_timing(
         self,
@@ -995,6 +1420,21 @@ class RobotClient:
             # Get action from queue
             pop_start = time.perf_counter() if timing is not None else 0.0
             timed_action = self.action_queue.get_nowait()
+            delayed_drops = 0
+            scheduled = (getattr(timed_action, "metadata", {}) or {}).get(
+                "scheduled_execution_time"
+            )
+            if scheduled is not None:
+                now_monotonic = time.monotonic()
+                while not self.action_queue.empty():
+                    next_action = self.action_queue.queue[0]
+                    next_scheduled = (getattr(next_action, "metadata", {}) or {}).get(
+                        "scheduled_execution_time"
+                    )
+                    if next_scheduled is None or next_scheduled > now_monotonic:
+                        break
+                    timed_action = self.action_queue.get_nowait()
+                    delayed_drops += 1
             pop_end = time.perf_counter() if timing is not None else 0.0
             # 2배속 소모를 원한다면...
             # timed_action = self.action_queue.get_nowait() 
@@ -1024,14 +1464,51 @@ class RobotClient:
         }
 
         action_log_start = time.perf_counter() if timing is not None else 0.0
-        with open(FINAL_ACTION_LOG, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")       
+        final_writer = getattr(self, "_final_action_writer", None)
+        if final_writer is not None:
+            final_writer.submit(record)
+        else:
+            # Compatibility for lightweight test clients constructed with
+            # __new__; production clients always use the background writer.
+            with open(FINAL_ACTION_LOG, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
         action_log_end = time.perf_counter() if timing is not None else 0.0
+
+        metadata = getattr(timed_action, "metadata", {}) or {}
+        self._submit_diagnostic(
+            {
+                "record_type": "action",
+                "wall_timestamp": record["wall_time"],
+                "monotonic_timestamp": robot_send_end if timing is not None else time.monotonic(),
+                "absolute_timestep": timed_action.get_timestep(),
+                "scheduled_execution_time": metadata.get("scheduled_execution_time"),
+                "actual_send_time": robot_send_end if timing is not None else time.monotonic(),
+                "source_chunk_id": metadata.get("source_chunk_id"),
+                "overlap_index": metadata.get("overlap_index"),
+                "overlap_length": metadata.get("overlap_length", 0),
+                "cosine_alpha": metadata.get("cosine_alpha"),
+                "old_action": metadata.get("old_action"),
+                "new_action": metadata.get("new_action"),
+                "blended_action": metadata.get(
+                    "blended_action", self._tensor_list(timed_action.get_action())
+                ),
+                "limited_action": logging_actions,
+                "old_new_disagreement_norm": metadata.get("old_new_disagreement_norm"),
+                "command_velocity": None,
+                "command_acceleration": None,
+                "command_jerk": None,
+                "measured_joint_position": None,
+                "measured_joint_position_reason": "trajectory post-processing disabled",
+                "position_tracking_error": None,
+                "stale_actions_dropped": delayed_drops,
+            },
+            downsample=True,
+        )
 
         if timing is not None:
             timing.update(
                 queue_size_before=queue_size_before,
-                queue_size_after=max(0, queue_size_before - 1),
+                queue_size_after=max(0, queue_size_before - 1 - delayed_drops),
                 queue_lock_wait_ms=(lock_acquired - get_start) * 1000,
                 queue_pop_ms=(pop_end - pop_start) * 1000,
                 action_to_dict_ms=(action_to_dict_end - action_to_dict_start) * 1000,
@@ -1421,7 +1898,12 @@ class RobotClient:
                     old_size, old_timesteps = 0, []
 
                 queue_update_start = time.perf_counter()
-                self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)
+                self._ingest_action_chunk(
+                    timed_actions,
+                    self.config.aggregate_fn,
+                    receive_wall_time=time.time(),
+                    receive_monotonic_time=time.monotonic(),
+                )
                 queue_update_time = time.perf_counter() - queue_update_start
 
                 # After receiving actions, the next empty queue triggers must-go processing.
@@ -1453,8 +1935,56 @@ class RobotClient:
             except Exception as e:
                 self.logger.error(f"Error in {self.remote_backend_name} action receiving loop: {e}")
 
+    def _policy_observation_loop(self, task: str, verbose: bool) -> None:
+        """Run policy observations at policy FPS, independently of command ticks."""
+        period = self.config.environment_dt
+        next_tick = time.monotonic()
+        while self.running:
+            if self._ready_to_send_observation():
+                if self.uses_grpc_backend:
+                    self.control_loop_observation(task, verbose, force_refill=True)
+                elif self.uses_remote_zmq_backend:
+                    self.control_loop_remote_observation(task, verbose)
+            next_tick += period
+            delay = next_tick - time.monotonic()
+            if delay <= 0:
+                # Skip missed observation slots; never issue a catch-up burst.
+                next_tick = time.monotonic() + period
+                delay = period
+            self.shutdown_event.wait(delay)
+
+    def _high_rate_control_loop(self, task: str, verbose: bool) -> tuple[Observation, Action]:
+        self.start_barrier.wait()
+        self.logger.info("High-rate trajectory control loop starting")
+        observation_thread = threading.Thread(
+            target=self._policy_observation_loop,
+            args=(task, verbose),
+            name="policy-observation-loop",
+            daemon=True,
+        )
+        observation_thread.start()
+        period = 1.0 / self.config.trajectory_postprocess.control_rate_hz
+        next_tick = time.monotonic()
+        performed = None
+        try:
+            while self.running:
+                performed = self.control_loop_trajectory_action(time.monotonic()) or performed
+                next_tick += period
+                delay = next_tick - time.monotonic()
+                if delay <= 0:
+                    # Re-anchor after a stall. There is exactly one send attempt
+                    # per iteration and no accumulated deadline catch-up.
+                    next_tick = time.monotonic() + period
+                    delay = period
+                self.shutdown_event.wait(delay)
+        finally:
+            observation_thread.join(timeout=1.0)
+        return None, performed
+
     def control_loop(self, task: str, verbose: bool = False) -> tuple[Observation, Action]:
         """Combined function for executing actions and streaming observations"""
+        if self.config.trajectory_postprocess.enabled:
+            return self._high_rate_control_loop(task, verbose)
         # Wait at barrier for synchronized start
         if self.uses_grpc_backend or self.uses_remote_zmq_backend:
             self.start_barrier.wait()

@@ -232,6 +232,7 @@ def build_limb_command(
     use_impedance: bool,
     stiffness: Any = None,
     torque_limit: Any = None,
+    damping_ratio: float = 1.0,
     hold_time: float = _CONTROL_HOLD_TIME,
 ) -> Any:
     """Build a single-limb joint command (impedance or plain position)."""
@@ -245,6 +246,7 @@ def build_limb_command(
             .set_velocity_limit(velocity_limit)
             .set_acceleration_limit(acceleration_limit)
             .set_stiffness(stiffness)
+            .set_damping_ratio(damping_ratio)
             .set_torque_limit(torque_limit)
         )
     return (
@@ -302,6 +304,7 @@ def build_body_command(
                 use_impedance=cfg.use_impedance,
                 stiffness=stiffness[_RIGHT_ARM_SLICE],
                 torque_limit=torque_limit[_RIGHT_ARM_SLICE],
+                damping_ratio=cfg.impedance_damping_ratio,
             )
         )
         has_command = True
@@ -322,6 +325,7 @@ def build_body_command(
                 use_impedance=cfg.use_impedance,
                 stiffness=stiffness[_LEFT_ARM_SLICE],
                 torque_limit=torque_limit[_LEFT_ARM_SLICE],
+                damping_ratio=cfg.impedance_damping_ratio,
             )
         )
         has_command = True

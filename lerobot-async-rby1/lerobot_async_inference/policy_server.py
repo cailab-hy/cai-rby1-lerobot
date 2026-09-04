@@ -462,13 +462,24 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         return False
 
-    def _time_action_chunk(self, t_0: float, action_chunk: list[torch.Tensor], i_0: int) -> list[TimedAction]:
+    def _time_action_chunk(
+        self,
+        t_0: float,
+        action_chunk: list[torch.Tensor],
+        i_0: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> list[TimedAction]:
         """Turn a chunk of actions into a list of TimedAction instances,
         with the first action corresponding to t_0 and the rest corresponding to
         t_0 + i*environment_dt for i in range(len(action_chunk))
         """
         return [
-            TimedAction(timestamp=t_0 + i * self.config.environment_dt, timestep=i_0 + i, action=action)
+            TimedAction(
+                timestamp=t_0 + i * self.config.environment_dt,
+                timestep=i_0 + i,
+                action=action,
+                metadata=dict(metadata or {}),
+            )
             for i, action in enumerate(action_chunk)
         ]
 
@@ -603,11 +614,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 )
             else:
                 self.logger.info("[RTC] bypass: %s", rtc_request.bypass_reason)
-        inference_start_wall_time = time.time() if prepared_capture is not None else None
+        inference_start_wall_time = time.time()
+        inference_start_monotonic = time.monotonic()
         start_inference = time.perf_counter()
         action_tensor = self._get_action_chunk(observation, rtc_request=rtc_request)
         inference_time = time.perf_counter() - start_inference
-        inference_end_wall_time = time.time() if prepared_capture is not None else None
+        inference_end_monotonic = time.monotonic()
+        inference_end_wall_time = time.time()
         self.logger.info(
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
         )
@@ -733,7 +746,16 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """5. Convert to TimedAction list"""
         chunk_build_start = time.perf_counter() if timing is not None else 0.0
         action_chunk = self._time_action_chunk(
-            observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
+            observation_t.get_timestamp(),
+            list(action_tensor),
+            observation_t.get_timestep(),
+            metadata={
+                "source_observation_timestep": observation_t.get_timestep(),
+                "inference_start_time": inference_start_wall_time,
+                "inference_end_time": inference_end_wall_time,
+                "inference_start_monotonic_time": inference_start_monotonic,
+                "inference_end_monotonic_time": inference_end_monotonic,
+            },
         )
         postprocess_stops = time.perf_counter()
         postprocessing_time = postprocess_stops - start_postprocess

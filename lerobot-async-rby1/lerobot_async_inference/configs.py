@@ -14,7 +14,7 @@
 
 import math
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 import torch
 
@@ -71,6 +71,91 @@ def get_aggregate_function(name: str) -> Callable[[torch.Tensor, torch.Tensor], 
         available = list(AGGREGATE_FUNCTIONS.keys())
         raise ValueError(f"Unknown aggregate function '{name}'. Available: {available}")
     return AGGREGATE_FUNCTIONS[name]
+
+
+@dataclass
+class JointTrajectoryLimitsConfig:
+    """Explicit command-space limits, keyed by LeRobot action feature name."""
+
+    position_limits: dict[str, tuple[float, float]] = field(default_factory=dict)
+    velocity_limits: dict[str, float] = field(default_factory=dict)
+    acceleration_limits: dict[str, float] = field(default_factory=dict)
+    jerk_limits: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class GripperTrajectoryConfig:
+    mode: str = "passthrough"
+    rate_limits: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class TrajectoryLoggingConfig:
+    enabled: bool = True
+    downsample: int = 1
+    path: str = "logs/action_pipeline.jsonl"
+    max_queue_size: int = 4096
+
+
+@dataclass
+class TrajectoryPostprocessConfig:
+    """Opt-in high-rate trajectory generation after chunk aggregation.
+
+    Live use remains opt-in. ``active_urdf`` requires an exact model/version
+    pair and combines URDF hard position limits with a named operational
+    profile. It never guesses a model or falls back to a generic URDF.
+    """
+
+    enabled: bool = False
+    limits_source: str = "active_urdf"
+    control_rate_hz: float | None = 500.0
+    profile: str = "balanced"
+    active_model: str | None = None
+    urdf_version: str | None = None
+    sdk_models_dir: str = "/home/nvidia/rby1-sdk/models"
+    interpolation: str = "jerk_limited"
+    arms: JointTrajectoryLimitsConfig = field(default_factory=JointTrajectoryLimitsConfig)
+    grippers: GripperTrajectoryConfig = field(default_factory=GripperTrajectoryConfig)
+    logging: TrajectoryLoggingConfig = field(default_factory=TrajectoryLoggingConfig)
+
+    def __post_init__(self) -> None:
+        if self.limits_source not in {"active_urdf", "explicit"}:
+            raise ValueError(
+                "trajectory_postprocess.limits_source must be active_urdf or explicit"
+            )
+        if self.profile not in {"mild", "balanced", "strong"}:
+            raise ValueError(
+                "trajectory_postprocess.profile must be mild, balanced, or strong"
+            )
+        if self.interpolation != "jerk_limited":
+            raise ValueError("trajectory_postprocess.interpolation must be 'jerk_limited'")
+        if self.enabled and (
+            self.control_rate_hz is None
+            or not math.isfinite(self.control_rate_hz)
+            or self.control_rate_hz <= 0
+        ):
+            raise ValueError(
+                "trajectory_postprocess.control_rate_hz must be explicitly set and positive when enabled"
+            )
+        if self.enabled and self.limits_source == "active_urdf" and (
+            not self.active_model or not self.urdf_version
+        ):
+            raise ValueError(
+                "active_urdf limits require explicit active_model and urdf_version; "
+                "automatic model guessing is disabled"
+            )
+        if self.enabled and self.limits_source == "active_urdf" and not self.sdk_models_dir.strip():
+            raise ValueError("trajectory_postprocess.sdk_models_dir cannot be empty")
+        if self.grippers.mode not in {"passthrough", "rate_limited"}:
+            raise ValueError(
+                "trajectory_postprocess.grippers.mode must be passthrough or rate_limited"
+            )
+        if self.logging.downsample <= 0:
+            raise ValueError("trajectory_postprocess.logging.downsample must be positive")
+        if self.logging.max_queue_size <= 0:
+            raise ValueError("trajectory_postprocess.logging.max_queue_size must be positive")
+        if self.logging.enabled and not self.logging.path.strip():
+            raise ValueError("trajectory_postprocess.logging.path cannot be empty")
 
 
 @dataclass
@@ -254,6 +339,10 @@ class RobotClientConfig:
         default="weighted_average",
         metadata={"help": f"Name of aggregate function to use. Options: {list(AGGREGATE_FUNCTIONS.keys())}"},
     )
+    trajectory_postprocess: TrajectoryPostprocessConfig = field(
+        default_factory=TrajectoryPostprocessConfig,
+        metadata={"help": "Opt-in jerk-limited high-rate action post-processing"},
+    )
 
     # Debug configuration
     debug_visualize_queue_size: bool = field(
@@ -292,6 +381,22 @@ class RobotClientConfig:
 
     def __post_init__(self):
         """Validate configuration after initialization."""
+        if isinstance(self.trajectory_postprocess, dict):
+            trajectory_data = dict(self.trajectory_postprocess)
+            if isinstance(trajectory_data.get("arms"), dict):
+                trajectory_data["arms"] = JointTrajectoryLimitsConfig(
+                    **trajectory_data["arms"]
+                )
+            if isinstance(trajectory_data.get("grippers"), dict):
+                trajectory_data["grippers"] = GripperTrajectoryConfig(
+                    **trajectory_data["grippers"]
+                )
+            if isinstance(trajectory_data.get("logging"), dict):
+                trajectory_data["logging"] = TrajectoryLoggingConfig(
+                    **trajectory_data["logging"]
+                )
+            self.trajectory_postprocess = TrajectoryPostprocessConfig(**trajectory_data)
+
         if self.backend not in SUPPORTED_BACKENDS:
             raise ValueError(f"backend must be one of {SUPPORTED_BACKENDS}, got {self.backend!r}")
 
@@ -316,6 +421,14 @@ class RobotClientConfig:
 
         if self.fps <= 0:
             raise ValueError(f"fps must be positive, got {self.fps}")
+
+        if (
+            self.trajectory_postprocess.enabled
+            and self.trajectory_postprocess.control_rate_hz < self.fps
+        ):
+            raise ValueError(
+                "trajectory_postprocess.control_rate_hz must be at least the policy fps"
+            )
 
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
@@ -404,6 +517,7 @@ class RobotClientConfig:
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "timing_diagnostics": self.timing_diagnostics,
             "aggregate_fn_name": self.aggregate_fn_name,
+            "trajectory_postprocess": asdict(self.trajectory_postprocess),
             "rtc_enabled": self.rtc_enabled,
             "rtc_mode": self.rtc_mode,
             "rtc_execution_horizon": self.rtc_execution_horizon,

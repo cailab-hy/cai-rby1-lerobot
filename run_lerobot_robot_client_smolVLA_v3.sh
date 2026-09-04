@@ -19,21 +19,27 @@ lerobot-robot-client \
       "serial_number_or_name": "260322274450",
       "fps": 15,
       "width": 640,
-      "height": 480
+      "height": 480,
+      "exposure": 8333,
+      "gain": 16
     },
     "camera2": {
       "type": "intelrealsense",
       "serial_number_or_name": "260322274992",
       "fps": 15,
       "width": 640,
-      "height": 480
+      "height": 480,
+      "exposure": 8333,
+      "gain": 16
     },
     "camera3": {
       "type": "intelrealsense",
       "serial_number_or_name": "260322276006",
       "fps": 15,
       "width": 640,
-      "height": 480
+      "height": 480,
+      "exposure": 8333,
+      "gain": 16
     }
   }' \
   --policy_type=smolvla \
@@ -46,11 +52,13 @@ lerobot-robot-client \
   --task="Pick up the bowl and place it in the box." \
   --fps=15 \
   --image_resize_scale=1.0 \
-  --jpeg_compression=true \
-  --save_camera_images=true \
-  --camera_image_log_dir=logs/camera_capture \
-  --camera_image_save_every_n=1
+  --jpeg_compression=true
 
 # Pick up the bowl and place it in the box.
 # Pick up the cup and place it in the box.
 # cosine_ramp
+#   --save_camera_images=true \
+#   --camera_image_log_dir=logs/camera_capture \
+#   --camera_image_save_every_n=1
+#   --robot.use_impedance=true \
+#   --robot.impedance_damping_ratio=1.0 \

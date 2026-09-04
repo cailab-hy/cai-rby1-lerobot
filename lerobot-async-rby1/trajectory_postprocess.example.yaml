@@ -1,0 +1,30 @@
+# Safe live default. The model/version were confirmed from the latest local
+# auto-detection logs, but the limiter remains disabled pending robot testing.
+trajectory_postprocess:
+  enabled: false
+  limits_source: active_urdf
+  control_rate_hz: 500
+  profile: balanced
+  active_model: a
+  urdf_version: "1.2"
+  sdk_models_dir: /home/nvidia/rby1-sdk/models
+  interpolation: jerk_limited
+  arms:
+    position_limits: {}
+    velocity_limits: {}
+    acceleration_limits: {}
+    jerk_limits: {}
+  grippers:
+    mode: passthrough
+    rate_limits: {}
+  logging:
+    enabled: true
+    downsample: 1
+    path: logs/action_pipeline.jsonl
+    max_queue_size: 4096
+
+# With limits_source=active_urdf, position/velocity/acceleration come from the
+# exact versioned URDF and the task profile supplies lower operational
+# velocity/acceleration plus jerk limits. Any mismatch fails before connect().
+# With limits_source=explicit, all four maps above must contain exactly the
+# enabled arm joints. Grippers remain passthrough for this validation.

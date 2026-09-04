@@ -168,8 +168,9 @@ class Rby1Config(RobotConfig):
         default_factory=lambda: [500.0] * 6 + [40.0] * 7 + [40.0] * 7
     )
 
-    # Damping ratio applied to all joints [0.0, 1.0].
-    # 0.7 gives critical damping; lower values allow faster motion.
+    # Dimensionless damping ratio applied to all commanded joints.
+    # 0.7 is underdamped; 1.0 is critically damped; values above 1.0 are
+    # overdamped.
     impedance_damping_ratio: float = 0.7
 
     # ── Velocity / acceleration limits ─────────────────────────────────

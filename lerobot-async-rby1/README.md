@@ -16,6 +16,8 @@ pip install -e .   # this package
 | `policy_server.py` | gRPC policy server |
 | `robot_client.py` | Robot client (gRPC / groot_zmq / pi05_zmq) |
 | `robot_replay.py` | Replay recorded actions (JSONL) |
+| `trajectory.py` | Stateful jerk-limited command generation |
+| `offline_trajectory_replay.py` | Hardware-free JSONL replay/metrics |
 | `policy/groot_zmq.py` | GR00T N1.6 ZMQ client |
 | `policy/pi05_zmq.py` | Pi0.5 ZMQ client |
 
@@ -36,6 +38,60 @@ lerobot-robot-replay --robot.type=rby1 --actions-file=actions.jsonl --fps=30
 ```
 
 Running via `python -m lerobot_async_inference.robot_client` works the same way.
+
+## Action aggregation and trajectory post-processing
+
+The gRPC server assigns each chunk action an absolute timestep and a wall-clock
+policy timestamp at the configured policy rate (15 Hz in the RB-Y1 launch
+scripts). The client converts that timestamp once, at chunk receipt, into its
+local monotonic clock domain. Queue overlap is matched by absolute timestep;
+`cosine_ramp` remains exactly
+`(1-alpha)*old + alpha*new`, where
+`alpha=(1-cos(pi*(i+1)/(N+1)))/2`. Old-only prefixes and incoming-only tails
+are retained. Actions already stale when received are discarded, and a delayed
+control tick selects only the newest due waypoint rather than sending a burst.
+
+RB-Y1 joint-mode action order is `right_arm_0..6`, `left_arm_0..6`, then
+`right_gripper_0`, `left_gripper_0`. Arm positions are radians. Grippers use the
+normalised LeRobot convention (1=open, 0=closed), so they are deliberately not
+fed through the arm limiter. The default gripper mode is immediate passthrough;
+an independent optional rate limiter is available.
+
+Trajectory generation is disabled by default. See
+`trajectory_postprocess.example.yaml`. With `limits_source=active_urdf`, live
+use requires an exact `active_model` and `urdf_version`; the parser refuses a
+generic URDF fallback and validates the complete 14-joint map and SI units.
+Position, manufacturer velocity, and manufacturer acceleration limits come
+from that versioned URDF. The named mild/balanced/strong task profile supplies
+lower operational velocity/acceleration and jerk limits and is rejected if it
+exceeds the URDF. `limits_source=explicit` still requires all four maps for all
+enabled arm joints. The SDK model reports a 2 ms internal update period, but
+the host-side 500 Hz loop still needs end-to-end timing validation;
+`normal_min_time` remains an independent SDK trajectory setting.
+
+The high-rate loop uses actual monotonic `dt`, starts from
+`Rby1.get_joint_positions()` at reset, and falls back to the last command only
+when a measurement read fails. Other robot adapters without a lightweight
+reader fall back to `get_observation()`; if neither produces all arm joints and
+there is no prior command, no command is sent. Call `client.reset_trajectory()`
+after any external episode reset. Diagnostic JSONL records both monotonic and
+wall timestamps, is bounded/background-written, can be downsampled, and is
+flushed on shutdown. A null measurement includes an explanatory reason.
+
+Hardware-free baseline or configured replay:
+
+```bash
+python -m lerobot_async_inference.offline_trajectory_replay \
+  /path/to/final_actions.jsonl \
+  --output outputs/offline_trajectory_replay.json
+
+# Add --limits-json=/path/to/validated_limits.json to enable processing.
+```
+
+Without an explicit limits file replay is intentionally identity processing,
+and records that the limiter was safely disabled. The report includes delta-q,
+acceleration and jerk RMS, per-joint maximum tracking deviation, selected left
+arm joints, and gripper timing preservation.
 
 ## gRPC camera image transport
 

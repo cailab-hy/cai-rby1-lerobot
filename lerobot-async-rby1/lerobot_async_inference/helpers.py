@@ -221,6 +221,7 @@ class TimedData:
 @dataclass
 class TimedAction(TimedData):
     action: Action
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def get_action(self):
         return self.action

@@ -1,5 +1,6 @@
 import pickle
 import threading
+import time
 import unittest
 from queue import Queue
 from types import SimpleNamespace
@@ -14,7 +15,8 @@ from lerobot_async_inference.robot_client import RobotClient
 
 def make_action(timestep: int) -> TimedAction:
     return TimedAction(
-        timestamp=float(timestep),
+        # TimedAction timestamps are scheduled wall-clock execution times.
+        timestamp=time.time() + float(timestep),
         timestep=timestep,
         action=torch.tensor([float(timestep)]),
     )
