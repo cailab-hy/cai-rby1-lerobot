@@ -90,6 +90,27 @@ server option is needed:
 lerobot-policy-server --host=0.0.0.0 --port=8080 --fps=15
 ```
 
+### Client camera-image capture
+
+The client can asynchronously save the exact camera images sent with inference
+requests. When JPEG transport is enabled, the writer reuses the transmitted
+JPEG bytes instead of encoding each image again.
+
+```bash
+lerobot-robot-client \
+  ... \
+  --jpeg_compression=true \
+  --save_camera_images=true \
+  --camera_image_log_dir=logs/camera_capture \
+  --camera_image_save_every_n=1
+```
+
+Each run creates a timestamped directory containing one subdirectory per camera
+and a `manifest.jsonl` that maps image paths to observation timestamps and
+timesteps. `camera_image_save_every_n` counts inference observations, not every
+control-loop frame. Disk writes happen on a bounded background queue; capture
+sets are dropped with a warning if the writer cannot keep up.
+
 ## Frozen SmolVLA noise diagnostic
 
 The policy server can save the first batch after transport decoding, normal

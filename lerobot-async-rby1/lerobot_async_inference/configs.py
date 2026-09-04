@@ -214,6 +214,18 @@ class RobotClientConfig:
         default=False,
         metadata={"help": "Compress camera images as JPEG immediately before network transport"},
     )
+    save_camera_images: bool = field(
+        default=False,
+        metadata={"help": "Save camera images sent by the client in a background writer"},
+    )
+    camera_image_log_dir: str = field(
+        default="logs/camera_capture",
+        metadata={"help": "Base directory for timestamped camera-image capture runs"},
+    )
+    camera_image_save_every_n: int = field(
+        default=1,
+        metadata={"help": "Save every Nth observation sent to the policy server"},
+    )
     image_crop_params: dict[str, tuple[int, int, int, int]] = field(
         default_factory=dict,
         metadata={
@@ -325,6 +337,11 @@ class RobotClientConfig:
 
         validate_image_resize_scale(self.image_resize_scale)
 
+        if self.save_camera_images and not self.camera_image_log_dir.strip():
+            raise ValueError("camera_image_log_dir cannot be empty when camera image saving is enabled")
+        if self.camera_image_save_every_n <= 0:
+            raise ValueError("camera_image_save_every_n must be positive")
+
         if self.zmq_timeout_ms <= 0:
             raise ValueError(f"zmq_timeout_ms must be positive, got {self.zmq_timeout_ms}")
 
@@ -375,6 +392,9 @@ class RobotClientConfig:
             "actions_per_chunk": self.actions_per_chunk,
             "image_resize_scale": self.image_resize_scale,
             "jpeg_compression": self.jpeg_compression,
+            "save_camera_images": self.save_camera_images,
+            "camera_image_log_dir": self.camera_image_log_dir,
+            "camera_image_save_every_n": self.camera_image_save_every_n,
             "image_crop_params": self.image_crop_params,
             "zmq_timeout_ms": self.zmq_timeout_ms,
             "front_camera_key": self.front_camera_key,

@@ -69,6 +69,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import asdict, replace
 from datetime import datetime
+from pathlib import Path
 from pprint import pformat
 from queue import Empty, Queue
 from typing import Any
@@ -113,6 +114,7 @@ from .policy.pi05_zmq import (
 
 
 
+from .camera_image_logger import CameraImageWriter
 from .configs import RobotClientConfig, cosine_ramp, cosine_ramp_alpha
 from .helpers import (
     Action,
@@ -172,6 +174,23 @@ class RobotClient:
         self.robot.connect()
         self.camera_keys = tuple(self.robot.cameras.keys())
         self.backend = getattr(config, "backend", "grpc")
+        self.camera_image_writer = (
+            CameraImageWriter(
+                Path(config.camera_image_log_dir) / LOG_RUN_ID,
+                self.camera_keys,
+                config.camera_image_save_every_n,
+                self.logger,
+            )
+            if config.save_camera_images
+            else None
+        )
+        if self.camera_image_writer is not None:
+            self.logger.info(
+                "Camera image capture enabled: directory=%s | cameras=%s | every_n=%d",
+                self.camera_image_writer.directory,
+                list(self.camera_keys),
+                config.camera_image_save_every_n,
+            )
 
         self.policy_config = None
         self.channel = None
@@ -355,6 +374,10 @@ class RobotClient:
         self.shutdown_event.set()
         self._clear_refill_in_flight()
 
+        camera_image_writer = getattr(self, "camera_image_writer", None)
+        if camera_image_writer is not None:
+            camera_image_writer.close()
+
         self.robot.disconnect()
         self.logger.debug("Robot disconnected")
 
@@ -428,6 +451,14 @@ class RobotClient:
                 image_stats.original_bytes,
                 image_stats.transport_bytes,
                 compression_ratio,
+            )
+
+        camera_image_writer = getattr(self, "camera_image_writer", None)
+        if camera_image_writer is not None:
+            camera_image_writer.submit(
+                observation_to_send.get_observation(),
+                wall_time=observation_to_send.get_timestamp(),
+                timestep=observation_to_send.get_timestep(),
             )
 
         start_time = time.perf_counter()
@@ -1253,6 +1284,14 @@ class RobotClient:
                 observation=raw_observation,
                 timestep=max(latest_action, 0),
             )
+
+            camera_image_writer = getattr(self, "camera_image_writer", None)
+            if camera_image_writer is not None:
+                camera_image_writer.submit(
+                    observation.get_observation(),
+                    wall_time=observation.get_timestamp(),
+                    timestep=observation.get_timestep(),
+                )
 
             obs_capture_time = time.perf_counter() - start_time
 
