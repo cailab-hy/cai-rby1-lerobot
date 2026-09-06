@@ -20,7 +20,7 @@ lerobot-robot-client \
       "fps": 15,
       "width": 640,
       "height": 480,
-      "exposure": 8333,
+      "exposure": 6336,
       "gain": 16
     },
     "camera2": {
@@ -29,7 +29,7 @@ lerobot-robot-client \
       "fps": 15,
       "width": 640,
       "height": 480,
-      "exposure": 8333,
+      "exposure": 6336,
       "gain": 16
     },
     "camera3": {
@@ -38,7 +38,7 @@ lerobot-robot-client \
       "fps": 15,
       "width": 640,
       "height": 480,
-      "exposure": 8333,
+      "exposure": 6336,
       "gain": 16
     }
   }' \
@@ -56,6 +56,11 @@ lerobot-robot-client \
   --save_camera_images=true \
   --camera_image_save_every_n=1 \
   --robot.use_impedance=true \
+  --robot.impedance_damping_ratio=1.0 \
+  --save_camera_images=true \
+  --camera_image_log_dir=logs/camera_capture \
+  --camera_image_save_every_n=1 \
+  --robot.use_impedance=true \
   --robot.impedance_damping_ratio=1.0
 
 # --- Language task settings ---
@@ -69,9 +74,9 @@ lerobot-robot-client \
 # --- Img save settings ---
 #   --save_camera_images=true \
 #   --camera_image_log_dir=logs/camera_capture \
-#   --camera_image_save_every_n=1
+#   --camera_image_save_every_n=1 \
 #   --robot.use_impedance=true \
-#   --robot.impedance_damping_ratio=1.0 \
+#   --robot.impedance_damping_ratio=1.0
 
 # --- Realsense camera settings ---
 #       "exposure": 8333,
