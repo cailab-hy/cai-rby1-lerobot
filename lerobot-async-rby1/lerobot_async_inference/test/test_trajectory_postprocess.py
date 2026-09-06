@@ -12,9 +12,8 @@ import numpy as np
 import torch
 
 from lerobot_async_inference.configs import cosine_ramp
-from lerobot_async_inference.diagnostic_logger import AsyncJSONLWriter
+from lerobot_async_inference.action_log_writer import AsyncJSONLWriter
 from lerobot_async_inference.helpers import TimedAction
-from lerobot_async_inference.offline_trajectory_replay import replay_profile
 from lerobot_async_inference.robot_client import RobotClient
 from lerobot_async_inference.trajectory import GripperPostprocessor, JerkLimitedTrajectory
 from lerobot_async_inference.urdf_limits import (
@@ -143,13 +142,6 @@ def make_scheduling_client(actions: list[TimedAction]) -> RobotClient:
     client.action_queue_lock = threading.Lock()
     client.latest_action_lock = threading.Lock()
     client.latest_action = -1
-    client.latest_action_tensor = None
-    client._chunk_counter = 0
-    client._action_diagnostic_writer = None
-    client._diagnostic_sample_counter = 0
-    client.config = SimpleNamespace(
-        trajectory_postprocess=SimpleNamespace(logging=SimpleNamespace(downsample=1))
-    )
     client.logger = SimpleNamespace(warning=lambda *_args, **_kwargs: None, debug=lambda *_args: None)
     return client
 
@@ -160,10 +152,9 @@ def test_stale_actions_are_dropped_by_scheduled_time() -> None:
         TimedAction(timestamp=101.0, timestep=1, action=torch.tensor([1.0])),
     ]
     client = make_scheduling_client([])
-    record = client._ingest_action_chunk(
+    client._ingest_action_chunk(
         actions, None, receive_wall_time=100.0, receive_monotonic_time=10.0
     )
-    assert record["stale_actions_dropped"] == 1
     assert [item.get_timestep() for item in client.action_queue.queue] == [1]
     assert client.action_queue.queue[0].metadata["scheduled_execution_time"] == 11.0
 
@@ -185,7 +176,7 @@ def test_control_delay_drops_old_waypoints_without_burst() -> None:
     assert [item.get_timestep() for item in client.action_queue.queue] == [3]
 
 
-def test_async_logger_flushes_and_sanitizes_nan() -> None:
+def test_action_logger_flushes_and_sanitizes_nan() -> None:
     with tempfile.TemporaryDirectory() as directory:
         path = f"{directory}/trace.jsonl"
         writer = AsyncJSONLWriter(path, max_queue_size=4)
@@ -269,31 +260,6 @@ def test_profile_above_manufacturer_limit_is_rejected() -> None:
         raise AssertionError("a profile above the manufacturer limit must be rejected")
 
 
-def test_offline_enabled_replay_uses_real_limiter_at_500hz() -> None:
-    limits = load_active_urdf_limits(
-        Path("/home/nvidia/rby1-sdk/models"), "a", "1.2"
-    )
-    profile = build_operational_profile("balanced", limits)
-    names = list(ARM_JOINT_NAMES) + ["right_gripper_0", "left_gripper_0"]
-    actions = np.zeros((3, len(names)), dtype=np.float64)
-    actions[1:, :14] = 0.01
-    actions[:, 14:] = [[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]]
-    stream = replay_profile(
-        np.asarray([10.0, 10.071, 10.151]),
-        names,
-        actions,
-        "irregular_log_dt",
-        profile,
-    )
-    assert np.allclose(np.diff(stream.times), 0.002)
-    assert not np.array_equal(stream.command, stream.reference)
-    for index, name in enumerate(ARM_JOINT_NAMES):
-        assert np.max(np.abs(stream.velocity[:, index])) <= profile.velocity_limits[name] + 1e-8
-        assert np.max(np.abs(stream.acceleration[:, index])) <= profile.acceleration_limits[name] + 1e-8
-        assert np.max(np.abs(stream.jerk[:, index])) <= profile.jerk_limits[name] + 1e-8
-    assert stream.invalid_samples == 0
-
-
 def load_tests(_loader, _tests, _pattern):
     functions = [
         test_cosine_ramp_full_action_regression_including_grippers,
@@ -306,12 +272,11 @@ def load_tests(_loader, _tests, _pattern):
         test_joint_position_limit_and_nan_fallback,
         test_stale_actions_are_dropped_by_scheduled_time,
         test_control_delay_drops_old_waypoints_without_burst,
-        test_async_logger_flushes_and_sanitizes_nan,
+        test_action_logger_flushes_and_sanitizes_nan,
         test_active_urdf_parser_extracts_all_arm_limits,
         test_arm_joint_map_must_be_exactly_complete,
         test_wrong_model_or_urdf_fails_closed,
         test_urdf_without_explicit_si_acceleration_units_fails_closed,
         test_profile_above_manufacturer_limit_is_rejected,
-        test_offline_enabled_replay_uses_real_limiter_at_500hz,
     ]
     return unittest.TestSuite(unittest.FunctionTestCase(function) for function in functions)

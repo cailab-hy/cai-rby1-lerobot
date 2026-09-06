@@ -30,7 +30,6 @@ import threading
 import time
 from concurrent import futures
 from dataclasses import asdict
-from pathlib import Path
 from pprint import pformat
 from queue import Empty, Queue
 from typing import Any
@@ -50,8 +49,6 @@ from lerobot.types import PolicyAction
 
 from .configs import PolicyServerConfig
 from .constants import SUPPORTED_POLICIES
-from .diagnostic_capture import PolicyBatchCaptureWriter
-from .frozen_noise_analysis import clone_to_cpu
 from .helpers import (
     FPSTracker,
     Observation,
@@ -63,7 +60,7 @@ from .helpers import (
     raw_observation_to_observation,
 )
 from .image_transport import decode_observation_images
-from .rtc import RTCDiagnosticsWriter, RTCRequest, RTCState, overlap_metrics
+from .rtc import RTCRequest, RTCState
 
 
 class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
@@ -83,24 +80,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self._predicted_timesteps = set()
 
         self.last_processed_obs = None
-        self._frozen_batch_dump_lock = threading.Lock()
-        self._frozen_batch_dumped = False
-        self._diagnostic_capture = (
-            PolicyBatchCaptureWriter(
-                config.diagnostic_capture_dir,
-                config.diagnostic_capture_max,
-                self.logger,
-            )
-            if config.diagnostic_capture_policy_batches
-            else None
-        )
-
         # Attributes will be set by SendPolicyInstructions
         self.device = None
         self.policy_type = None
         self.lerobot_features = None
         self.actions_per_chunk = None
-        self.timing_diagnostics = False
         self.policy = None
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
@@ -111,7 +95,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.rtc_max_guidance_weight = 10.0
         self.rtc_prefix_attention_schedule = "EXP"
         self._rtc_state: RTCState | None = None
-        self._rtc_diagnostics: RTCDiagnosticsWriter | None = None
 
     @property
     def running(self):
@@ -130,11 +113,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         with self._predicted_timesteps_lock:
             self._predicted_timesteps = set()
 
-        self.timing_diagnostics = False
         self._rtc_state = None
-        if self._rtc_diagnostics is not None:
-            self._rtc_diagnostics.close()
-            self._rtc_diagnostics = None
 
     def Ready(self, request, context):  # noqa: N802
         client_id = context.peer()
@@ -177,10 +156,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.lerobot_features = policy_specs.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk
         self.pretrained_name_or_path = policy_specs.pretrained_name_or_path
-        self.timing_diagnostics = getattr(policy_specs, "timing_diagnostics", False)
-        if self.timing_diagnostics:
-            self.logger.info("[TIMING] Server diagnostics enabled by client policy setup")
-
         policy_class = get_policy_class(self.policy_type)
 
         start = time.perf_counter()
@@ -217,17 +192,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self.policy.config.rtc_config = rtc_config
             self.policy.init_rtc_processor()
             self._rtc_state = RTCState(self.config.fps)
-            self._rtc_diagnostics = RTCDiagnosticsWriter(
-                getattr(policy_specs, "rtc_diagnostics_dir", "outputs")
-            )
             self.logger.info(
                 "[RTC] enabled=True mode=%s execution_horizon=%d "
-                "max_guidance_weight=%.1f schedule=%s diagnostics=%s",
+                "max_guidance_weight=%.1f schedule=%s",
                 self.rtc_mode,
                 self.rtc_execution_horizon,
                 self.rtc_max_guidance_weight,
                 self.rtc_prefix_attention_schedule,
-                self._rtc_diagnostics.path,
             )
 
         # Load preprocessor and postprocessor, overriding device to match requested device
@@ -254,24 +225,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.logger.debug(f"Receiving observations from {client_id}")
 
         receive_time = time.time()  # event correlation only; never used for a duration
-        receive_start = time.perf_counter()
         received_bytes = receive_bytes_in_chunks(
             request_iterator, None, self.shutdown_event, self.logger
         )  # blocking call while looping over request_iterator
-        receive_end = time.perf_counter() if self.timing_diagnostics else 0.0
-        observation_received_wall_time = (
-            time.time() if self.timing_diagnostics else receive_time
-        )
-
-        start_deserialize = time.perf_counter() if self.timing_diagnostics else receive_start
+        start_deserialize = time.perf_counter()
         timed_observation = pickle.loads(received_bytes)  # nosec
         deserialize_time = time.perf_counter() - start_deserialize
 
-        transport_decode_start = time.perf_counter() if self.timing_diagnostics else 0.0
         decoded_observation, image_stats = decode_observation_images(timed_observation.get_observation())
-        transport_decode_time = (
-            time.perf_counter() - transport_decode_start if self.timing_diagnostics else 0.0
-        )
         if image_stats.image_count:
             timed_observation.observation = decoded_observation
             self.logger.debug(
@@ -309,24 +270,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         ):
             self.logger.debug(f"Observation #{obs_timestep} has been filtered out")
 
-        if self.timing_diagnostics:
-            self.logger.debug(
-                "[TIMING][SERVER_OBSERVATION] event_wall_time=%.6f rpc_start_wall_time=%.6f "
-                "chunk_id=%s "
-                "grpc_receive_ms=%.3f pickle_deserialize_ms=%.3f "
-                "server_transport_decode_ms=%.3f jpeg_decode_ms=%.3f "
-                "restore_resize_ms=%.3f received_bytes=%s",
-                observation_received_wall_time,
-                receive_time,
-                obs_timestep,
-                (receive_end - receive_start) * 1000,
-                deserialize_time * 1000,
-                transport_decode_time * 1000,
-                image_stats.jpeg_decode_time * 1000,
-                image_stats.restore_resize_time * 1000,
-                len(received_bytes),
-            )
-
         return services_pb2.Empty()
 
     def GetActions(self, request, context):  # noqa: N802
@@ -339,11 +282,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         try:
             getactions_starts = time.perf_counter()
             obs = self.observation_queue.get(timeout=self.config.obs_queue_timeout)
-            observation_queue_wait_ms = (
-                (time.perf_counter() - getactions_starts) * 1000
-                if self.timing_diagnostics
-                else 0.0
-            )
             self.logger.info(
                 f"Running inference for observation #{obs.get_timestep()} (must_go: {obs.must_go})"
             )
@@ -352,8 +290,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 self._predicted_timesteps.add(obs.get_timestep())
 
             start_time = time.perf_counter()
-            policy_timing = {} if self.timing_diagnostics else None
-            action_chunk = self._predict_action_chunk(obs, timing=policy_timing)
+            action_chunk = self._predict_action_chunk(obs)
             inference_time = time.perf_counter() - start_time
 
             start_time = time.perf_counter()
@@ -362,7 +299,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
             # Create and return the action chunk
             actions = services_pb2.Actions(data=actions_bytes)
-            chunk_ready_wall_time = time.time() if self.timing_diagnostics else 0.0
 
             self.logger.info(
                 f"Action chunk #{obs.get_timestep()} generated | "
@@ -380,33 +316,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 0, self.config.inference_latency - max(0, time.perf_counter() - getactions_starts)
             )
             time.sleep(response_delay)  # sleep controls inference latency
-
-            if self.timing_diagnostics:
-                chunk_first = action_chunk[0].get_timestep() if action_chunk else None
-                chunk_last = action_chunk[-1].get_timestep() if action_chunk else None
-                self.logger.info(
-                    "[TIMING][SERVER_CHUNK] event_wall_time=%.6f chunk_ready_wall_time=%.6f "
-                    "chunk_id=%s chunk_first=%s chunk_last=%s observation_queue_wait_ms=%.3f "
-                    "server_raw_observation_prepare_ms=%.3f server_policy_preprocess_ms=%.3f "
-                    "server_inference_ms=%.3f server_policy_postprocess_ms=%.3f "
-                    "server_action_chunk_build_ms=%.3f server_action_serialize_ms=%.3f "
-                    "server_total_policy_ms=%.3f response_delay_ms=%.3f get_actions_total_ms=%.3f",
-                    time.time(),
-                    chunk_ready_wall_time,
-                    obs.get_timestep(),
-                    chunk_first,
-                    chunk_last,
-                    observation_queue_wait_ms,
-                    policy_timing["server_raw_observation_prepare_ms"],
-                    policy_timing["server_policy_preprocess_ms"],
-                    policy_timing["server_inference_ms"],
-                    policy_timing["server_policy_postprocess_ms"],
-                    policy_timing["server_action_chunk_build_ms"],
-                    serialize_time * 1000,
-                    policy_timing["server_total_policy_ms"],
-                    response_delay * 1000,
-                    (time.perf_counter() - getactions_starts) * 1000,
-                )
 
             return actions
 
@@ -467,7 +376,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         t_0: float,
         action_chunk: list[torch.Tensor],
         i_0: int,
-        metadata: dict[str, Any] | None = None,
     ) -> list[TimedAction]:
         """Turn a chunk of actions into a list of TimedAction instances,
         with the first action corresponding to t_0 and the rest corresponding to
@@ -478,7 +386,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 timestamp=t_0 + i * self.config.environment_dt,
                 timestep=i_0 + i,
                 action=action,
-                metadata=dict(metadata or {}),
             )
             for i, action in enumerate(action_chunk)
         ]
@@ -504,34 +411,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         return chunk[:, : self.actions_per_chunk, :]
 
-    def _dump_frozen_policy_batch_once(
-        self, observation: dict[str, Any], *, timestep: int
-    ) -> None:
-        """Save one exact post-preprocessor batch without mutating inference input."""
-        dump_path = self.config.dump_frozen_policy_batch
-        if dump_path is None or self._frozen_batch_dumped:
-            return
-
-        with self._frozen_batch_dump_lock:
-            if self._frozen_batch_dumped:
-                return
-
-            path = Path(dump_path).expanduser()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            frozen_batch = clone_to_cpu(observation)
-            torch.save(frozen_batch, path)
-            self._frozen_batch_dumped = True
-            self.logger.info(
-                "[FROZEN_OBS] saved policy-ready batch | path=%s | timestep=%s | keys=%s",
-                path,
-                timestep,
-                sorted(map(str, observation.keys())),
-            )
-
     def _predict_action_chunk(
         self,
         observation_t: TimedObservation,
-        timing: dict[str, float] | None = None,
     ) -> list[TimedAction]:
         """Predict an action chunk based on an observation.
 
@@ -543,9 +425,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         5. Convert to TimedAction list
         """
         """1. Prepare observation"""
-        diagnostic_request_kind = (
-            "initial" if self.last_processed_obs is None else "refill"
-        ) if self._diagnostic_capture is not None else None
         start_prepare = time.perf_counter()
         observation: Observation = raw_observation_to_observation(
             observation_t.get_observation(),
@@ -560,67 +439,15 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.last_processed_obs: TimedObservation = observation_t
         preprocessing_time = time.perf_counter() - start_preprocess
 
-        # This is the exact object shape/content passed to SmolVLA below. The
-        # helper recursively clones tensors to CPU, so neither this batch nor
-        # policy inference is changed by the diagnostic capture.
-        if self.config.dump_frozen_policy_batch is not None:
-            self._dump_frozen_policy_batch_once(
-                observation, timestep=observation_t.get_timestep()
-            )
-
-        prepared_capture = None
-        if self._diagnostic_capture is not None:
-            task = observation.get("task")
-            if isinstance(task, (list, tuple)) and len(task) == 1:
-                task = task[0]
-            if not isinstance(task, (str, int, float, bool, type(None))):
-                task = repr(task)
-            prepared_capture = self._diagnostic_capture.prepare(
-                observation,
-                {
-                    "wall_time": time.time(),
-                    "policy_timestamp": observation_t.get_timestamp(),
-                    "timestep": observation_t.get_timestep(),
-                    "must_go": observation_t.must_go,
-                    "request_kind": diagnostic_request_kind,
-                    "initial_request": diagnostic_request_kind == "initial",
-                    "refill_request": diagnostic_request_kind == "refill",
-                    # The client execution queue is not transported to the
-                    # server; report that explicitly instead of guessing.
-                    "queue_size": None,
-                    "executed_timestep": None,
-                    "server_observation_queue_size": self.observation_queue.qsize(),
-                    "task": task,
-                    "checkpoint": self.pretrained_name_or_path,
-                    "num_steps": getattr(self.policy.config, "num_steps", None),
-                    "fps": self.config.fps,
-                    "actions_per_chunk": self.actions_per_chunk,
-                },
-            )
-
         """3. Get action chunk"""
         rtc_request = (
             self._rtc_state.prepare(observation_t.get_timestep())
             if self.rtc_enabled and self._rtc_state is not None
             else None
         )
-        if rtc_request is not None:
-            if rtc_request.applied:
-                self.logger.info(
-                    "[RTC] guided: prefix_len=%d inference_delay=%d shift=%d",
-                    rtc_request.prefix.shape[0],
-                    rtc_request.inference_delay_frames,
-                    rtc_request.shift,
-                )
-            else:
-                self.logger.info("[RTC] bypass: %s", rtc_request.bypass_reason)
-        inference_start_wall_time = time.time()
-        inference_start_monotonic = time.monotonic()
         start_inference = time.perf_counter()
         action_tensor = self._get_action_chunk(observation, rtc_request=rtc_request)
         inference_time = time.perf_counter() - start_inference
-        inference_end_monotonic = time.monotonic()
-        inference_end_wall_time = time.time()
         self.logger.info(
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
         )
@@ -631,18 +458,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # So we process each action in the chunk individually
         start_postprocess = time.perf_counter()
         _, chunk_size, _ = action_tensor.shape
-        raw_capture_clone_started = time.perf_counter() if prepared_capture is not None else 0.0
-        raw_action_tensor_for_capture = None
         raw_action_tensor_for_rtc = None
-        if prepared_capture is not None:
-            raw_action_tensor_for_capture = action_tensor.squeeze(0).detach().clone()
         if self.rtc_enabled:
             raw_action_tensor_for_rtc = action_tensor.squeeze(0).detach().clone()
-        raw_capture_clone_ms = (
-            (time.perf_counter() - raw_capture_clone_started) * 1000
-            if prepared_capture is not None
-            else 0.0
-        )
 
         # Process each action in the chunk
         processed_actions = []
@@ -665,110 +483,20 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 torch.isfinite(raw_action_tensor_for_rtc).all()
             ):
                 raise RuntimeError("RTC produced NaN or Inf; refusing to return an action chunk")
-            metrics = overlap_metrics(
-                rtc_request.previous_robot_leftover if rtc_request is not None else None,
-                action_tensor,
-            )
             self._rtc_state.complete(
                 raw_chunk=raw_action_tensor_for_rtc,
-                robot_chunk=action_tensor,
                 timestep=observation_t.get_timestep(),
                 latency_s=inference_time,
             )
-            record = {
-                "request_id": observation_t.get_timestep(),
-                "policy_timestamp": observation_t.get_timestamp(),
-                "rtc_enabled": True,
-                "rtc_applied": bool(rtc_request and rtc_request.applied),
-                "rtc_bypass_reason": rtc_request.bypass_reason if rtc_request else None,
-                "mode": self.rtc_mode,
-                "execution_horizon": self.rtc_execution_horizon,
-                "max_guidance_weight": self.rtc_max_guidance_weight,
-                "prefix_schedule": self.rtc_prefix_attention_schedule,
-                "inference_latency_ms": inference_time * 1000,
-                "inference_delay_frames": (
-                    rtc_request.inference_delay_frames if rtc_request else 0
-                ),
-                "delay_frames_float": rtc_request.delay_frames_float if rtc_request else 0.0,
-                "delay_estimator_ready": bool(
-                    rtc_request and rtc_request.delay_estimator_ready
-                ),
-                "delay_estimator_window_count": (
-                    rtc_request.delay_estimator_window_count if rtc_request else 0
-                ),
-                "delay_estimator_window_max_ms": (
-                    rtc_request.delay_estimator_window_max_ms if rtc_request else None
-                ),
-                "prev_leftover_count": (
-                    int(rtc_request.prefix.shape[0])
-                    if rtc_request is not None and rtc_request.prefix is not None
-                    else 0
-                ),
-                "previous_chunk_shift": rtc_request.shift if rtc_request else 0,
-                **metrics,
-            }
-            self.logger.info(
-                "[RTC] enabled=True mode=%s execution_horizon=%d max_guidance_weight=%.1f "
-                "schedule=%s inference_latency_ms=%.3f inference_delay_frames=%d "
-                "delay_frames_float=%.3f delay_estimator_ready=%s "
-                "delay_estimator_window_count=%d delay_estimator_window_max_ms=%s "
-                "prev_chunk_left_over_length=%d rtc_applied=%s rtc_bypass_reason=%s",
-                self.rtc_mode,
-                self.rtc_execution_horizon,
-                self.rtc_max_guidance_weight,
-                self.rtc_prefix_attention_schedule,
-                inference_time * 1000,
-                record["inference_delay_frames"],
-                record["delay_frames_float"],
-                record["delay_estimator_ready"],
-                record["delay_estimator_window_count"],
-                record["delay_estimator_window_max_ms"],
-                record["prev_leftover_count"],
-                record["rtc_applied"],
-                record["rtc_bypass_reason"],
-            )
-            if self._rtc_diagnostics is not None:
-                self._rtc_diagnostics.write(record)
-        if prepared_capture is not None:
-            self._diagnostic_capture.submit(
-                prepared_capture,
-                raw_action_tensor_for_capture,
-                action_tensor,
-                {
-                    "inference_start_time": inference_start_wall_time,
-                    "inference_end_time": inference_end_wall_time,
-                    "inference_latency_ms": inference_time * 1000,
-                    "raw_preserve_clone_ms": raw_capture_clone_ms,
-                },
-            )
-        policy_postprocess_end = time.perf_counter() if timing is not None else 0.0
 
         """5. Convert to TimedAction list"""
-        chunk_build_start = time.perf_counter() if timing is not None else 0.0
         action_chunk = self._time_action_chunk(
             observation_t.get_timestamp(),
             list(action_tensor),
             observation_t.get_timestep(),
-            metadata={
-                "source_observation_timestep": observation_t.get_timestep(),
-                "inference_start_time": inference_start_wall_time,
-                "inference_end_time": inference_end_wall_time,
-                "inference_start_monotonic_time": inference_start_monotonic,
-                "inference_end_monotonic_time": inference_end_monotonic,
-            },
         )
         postprocess_stops = time.perf_counter()
         postprocessing_time = postprocess_stops - start_postprocess
-
-        if timing is not None:
-            timing.update(
-                server_raw_observation_prepare_ms=prepare_time * 1000,
-                server_policy_preprocess_ms=preprocessing_time * 1000,
-                server_inference_ms=inference_time * 1000,
-                server_policy_postprocess_ms=(policy_postprocess_end - start_postprocess) * 1000,
-                server_action_chunk_build_ms=(postprocess_stops - chunk_build_start) * 1000,
-                server_total_policy_ms=(postprocess_stops - start_prepare) * 1000,
-            )
 
         self.logger.info(
             f"Observation {observation_t.get_timestep()} | "
@@ -789,8 +517,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     def stop(self):
         """Stop the server"""
         self._reset_server()
-        if self._diagnostic_capture is not None:
-            self._diagnostic_capture.close()
         self.logger.info("Server stopping...")
 
 

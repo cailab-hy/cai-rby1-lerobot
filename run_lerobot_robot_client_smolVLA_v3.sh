@@ -37,7 +37,7 @@ lerobot-robot-client \
       "serial_number_or_name": "260322276006",
       "fps": 15,
       "width": 640,
-      "height": 480, 
+      "height": 480,
       "exposure": 8333,
       "gain": 16
     }
@@ -49,7 +49,7 @@ lerobot-robot-client \
   --actions_per_chunk=50 \
   --chunk_size_threshold=0.5 \
   --aggregate_fn_name=cosine_ramp \
-  --task="Pick up the cup and place it in the box." \
+  --task="Pick up the bowl and place it in the box." \
   --fps=15 \
   --image_resize_scale=1.0 \
   --jpeg_compression=true \

@@ -23,7 +23,7 @@ def make_action(timestep: int) -> TimedAction:
 
 
 class RefillRequestTest(unittest.TestCase):
-    def make_client(self, queue_size: int = 0, timing_diagnostics: bool = False) -> RobotClient:
+    def make_client(self, queue_size: int = 0) -> RobotClient:
         client = RobotClient.__new__(RobotClient)
         client.backend = "grpc"
         client.action_queue = Queue()
@@ -36,8 +36,6 @@ class RefillRequestTest(unittest.TestCase):
         client._chunk_size_threshold = 0.5
         client._refill_in_flight = False
         client._refill_request_sent = False
-        client._refill_request_queue_size = None
-        client._refill_request_queue_ratio = None
         client.must_go = threading.Event()
         client.must_go.set()
         client.shutdown_event = threading.Event()
@@ -46,7 +44,6 @@ class RefillRequestTest(unittest.TestCase):
         client.config = SimpleNamespace(
             client_device="cpu",
             aggregate_fn=lambda old, new: new,
-            timing_diagnostics=timing_diagnostics,
         )
         return client
 
@@ -77,8 +74,6 @@ class RefillRequestTest(unittest.TestCase):
         self.drain_to(client, 25)
         self.assertTrue(client._ready_to_send_observation())
         self.assertTrue(client._refill_in_flight)
-        self.assertEqual(client._refill_request_queue_size, 25)
-        self.assertEqual(client._refill_request_queue_ratio, 0.5)
 
     def test_in_flight_refill_blocks_duplicate_requests(self):
         client = self.make_client(queue_size=25)
@@ -89,7 +84,7 @@ class RefillRequestTest(unittest.TestCase):
             self.assertFalse(client._ready_to_send_observation())
 
     def test_successful_chunk_merge_clears_refill_state(self):
-        client = self.make_client(queue_size=20, timing_diagnostics=True)
+        client = self.make_client(queue_size=20)
         client._refill_in_flight = True
         client._refill_request_sent = True
         incoming = [make_action(timestep) for timestep in range(20, 70)]
@@ -98,12 +93,6 @@ class RefillRequestTest(unittest.TestCase):
 
         self.assertFalse(client._refill_in_flight)
         self.assertEqual(client.action_queue.qsize(), 70)
-        refill_logs = [
-            call.args[0]
-            for call in client.logger.info.call_args_list
-            if call.args and "[TIMING][REFILL_COMPLETE]" in call.args[0]
-        ]
-        self.assertEqual(len(refill_logs), 1)
 
     def test_next_threshold_cycle_can_reserve_one_new_request(self):
         client = self.make_client(queue_size=25)
@@ -136,12 +125,12 @@ class RefillRequestTest(unittest.TestCase):
         self.assertTrue(client._ready_to_send_observation())
 
     def test_startup_forces_one_observation_and_marks_it_must_go(self):
-        client = self.make_client(queue_size=0, timing_diagnostics=True)
+        client = self.make_client(queue_size=0)
         client.action_chunk_size = -1
         client.robot = SimpleNamespace(get_observation=Mock(return_value={"state": [0.0]}))
         sent_observations = []
 
-        def send_observation(observation, timing=None):
+        def send_observation(observation):
             sent_observations.append(observation)
             return True
 
@@ -155,12 +144,6 @@ class RefillRequestTest(unittest.TestCase):
         self.assertTrue(client._refill_in_flight)
         self.assertTrue(client._refill_request_sent)
         self.assertFalse(client._ready_to_send_observation())
-        refill_logs = [
-            call.args[0]
-            for call in client.logger.info.call_args_list
-            if call.args and "[TIMING][REFILL_REQUEST]" in call.args[0]
-        ]
-        self.assertEqual(len(refill_logs), 1)
 
     def test_failed_observation_send_rolls_back_for_retry(self):
         client = self.make_client(queue_size=0)

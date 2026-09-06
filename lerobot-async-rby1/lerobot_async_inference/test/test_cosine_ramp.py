@@ -1,8 +1,6 @@
 import threading
 import unittest
 from queue import Queue
-from types import SimpleNamespace
-from unittest.mock import Mock
 
 import torch
 
@@ -77,7 +75,6 @@ class CosineRampQueueMergeTest(unittest.TestCase):
         client.action_queue_lock = threading.Lock()
         client.latest_action_lock = threading.Lock()
         client.latest_action = latest_action
-        client.latest_action_tensor = None
         return client
 
     @staticmethod
@@ -144,28 +141,6 @@ class CosineRampQueueMergeTest(unittest.TestCase):
             self.assertLess(by_timestep[timestep].get_action().item(), 1.0)
         for timestep in range(75, 105):
             self.assertIs(by_timestep[timestep], incoming_actions[timestep - 55])
-
-    def test_timing_diagnostics_log_ramp_samples_and_boundary_metrics(self):
-        client = self.make_client(
-            latest_action=49,
-            old_actions=[make_action(timestep, 0.0) for timestep in range(50, 54)],
-        )
-        client.latest_action_tensor = torch.tensor([0.0])
-        client.robot = SimpleNamespace(action_features={"left_arm_0": float})
-        client.logger = Mock()
-
-        client._aggregate_action_queues(
-            [make_action(timestep, 1.0) for timestep in range(50, 55)],
-            get_aggregate_function("cosine_ramp"),
-            timing={},
-        )
-
-        messages = [call.args[0] for call in client.logger.debug.call_args_list]
-        self.assertTrue(any(message.startswith("[COSINE_RAMP]") for message in messages))
-        self.assertTrue(
-            any(message.startswith("[COSINE_RAMP][BOUNDARY]") for message in messages)
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

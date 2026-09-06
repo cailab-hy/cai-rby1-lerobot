@@ -51,8 +51,7 @@ lerobot-robot-client \
   --rtc_mode=guided \
   --rtc_execution_horizon=10 \
   --rtc_max_guidance_weight=10.0 \
-  --rtc_prefix_attention_schedule=EXP \
-  --rtc_diagnostics_dir=/home/cai/rby1-lerobot/cai-rby1-lerobot/lerobot-async-rby1/outputs/rtc_robot
+  --rtc_prefix_attention_schedule=EXP
 
 # Pick up the bowl and place it in the box.
 # Pick up the cup and place it in the box.

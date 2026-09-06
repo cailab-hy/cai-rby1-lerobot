@@ -90,14 +90,6 @@ class GripperTrajectoryConfig:
 
 
 @dataclass
-class TrajectoryLoggingConfig:
-    enabled: bool = True
-    downsample: int = 1
-    path: str = "logs/action_pipeline.jsonl"
-    max_queue_size: int = 4096
-
-
-@dataclass
 class TrajectoryPostprocessConfig:
     """Opt-in high-rate trajectory generation after chunk aggregation.
 
@@ -116,7 +108,6 @@ class TrajectoryPostprocessConfig:
     interpolation: str = "jerk_limited"
     arms: JointTrajectoryLimitsConfig = field(default_factory=JointTrajectoryLimitsConfig)
     grippers: GripperTrajectoryConfig = field(default_factory=GripperTrajectoryConfig)
-    logging: TrajectoryLoggingConfig = field(default_factory=TrajectoryLoggingConfig)
 
     def __post_init__(self) -> None:
         if self.limits_source not in {"active_urdf", "explicit"}:
@@ -150,12 +141,6 @@ class TrajectoryPostprocessConfig:
             raise ValueError(
                 "trajectory_postprocess.grippers.mode must be passthrough or rate_limited"
             )
-        if self.logging.downsample <= 0:
-            raise ValueError("trajectory_postprocess.logging.downsample must be positive")
-        if self.logging.max_queue_size <= 0:
-            raise ValueError("trajectory_postprocess.logging.max_queue_size must be positive")
-        if self.logging.enabled and not self.logging.path.strip():
-            raise ValueError("trajectory_postprocess.logging.path cannot be empty")
 
 
 @dataclass
@@ -180,30 +165,6 @@ class PolicyServerConfig:
         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
     )
 
-    # Optional, one-shot offline diagnostic capture. Keeping this disabled has
-    # no effect on the inference path.
-    dump_frozen_policy_batch: str | None = field(
-        default=None,
-        metadata={
-            "help": "Save the first policy-ready (post-preprocessor) batch for offline diagnostics"
-        },
-    )
-
-    # Optional multi-observation diagnostic. Disabled by default so the
-    # production inference path does not clone tensors or create a writer.
-    diagnostic_capture_policy_batches: bool = field(
-        default=False,
-        metadata={"help": "Capture every policy-ready batch and generated action chunk"},
-    )
-    diagnostic_capture_dir: str = field(
-        default="outputs/near_grasp_capture",
-        metadata={"help": "Directory for policy batch/chunk diagnostic captures"},
-    )
-    diagnostic_capture_max: int = field(
-        default=50,
-        metadata={"help": "Maximum diagnostic captures per policy-server process"},
-    )
-
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.port < 1 or self.port > 65535:
@@ -217,12 +178,6 @@ class PolicyServerConfig:
 
         if self.obs_queue_timeout < 0:
             raise ValueError(f"obs_queue_timeout must be non-negative, got {self.obs_queue_timeout}")
-
-        if self.diagnostic_capture_max <= 0:
-            raise ValueError(
-                "diagnostic_capture_max must be positive, "
-                f"got {self.diagnostic_capture_max}"
-            )
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "PolicyServerConfig":
@@ -344,13 +299,9 @@ class RobotClientConfig:
         metadata={"help": "Opt-in jerk-limited high-rate action post-processing"},
     )
 
-    # Debug configuration
+    # Debug configuration inherited from upstream.
     debug_visualize_queue_size: bool = field(
         default=False, metadata={"help": "Visualize the action queue size"}
-    )
-    timing_diagnostics: bool = field(
-        default=False,
-        metadata={"help": "Enable low-overhead control-loop timing diagnostics"},
     )
     rtc_enabled: bool = field(
         default=False,
@@ -369,10 +320,6 @@ class RobotClientConfig:
     rtc_prefix_attention_schedule: str = field(
         default="EXP", metadata={"help": "RTC prefix attention schedule: ZEROS, ONES, LINEAR, or EXP"}
     )
-    rtc_diagnostics_dir: str = field(
-        default="outputs",
-        metadata={"help": "Server-side directory for rtc_diagnostics_<timestamp>.jsonl"},
-    )
 
     @property
     def environment_dt(self) -> float:
@@ -390,10 +337,6 @@ class RobotClientConfig:
             if isinstance(trajectory_data.get("grippers"), dict):
                 trajectory_data["grippers"] = GripperTrajectoryConfig(
                     **trajectory_data["grippers"]
-                )
-            if isinstance(trajectory_data.get("logging"), dict):
-                trajectory_data["logging"] = TrajectoryLoggingConfig(
-                    **trajectory_data["logging"]
                 )
             self.trajectory_postprocess = TrajectoryPostprocessConfig(**trajectory_data)
 
@@ -515,7 +458,6 @@ class RobotClientConfig:
             "right_wrist_camera_key": self.right_wrist_camera_key,
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
-            "timing_diagnostics": self.timing_diagnostics,
             "aggregate_fn_name": self.aggregate_fn_name,
             "trajectory_postprocess": asdict(self.trajectory_postprocess),
             "rtc_enabled": self.rtc_enabled,
@@ -523,5 +465,4 @@ class RobotClientConfig:
             "rtc_execution_horizon": self.rtc_execution_horizon,
             "rtc_max_guidance_weight": self.rtc_max_guidance_weight,
             "rtc_prefix_attention_schedule": self.rtc_prefix_attention_schedule,
-            "rtc_diagnostics_dir": self.rtc_diagnostics_dir,
         }
