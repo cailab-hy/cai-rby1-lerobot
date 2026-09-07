@@ -1,0 +1,163 @@
+{
+  "robot_client_script": "../run_lerobot_robot_client_smolVLA_v3.sh",
+  "host": "0.0.0.0",
+  "port": 8001,
+  "camera_fps": 15,
+  "camera_width": 640,
+  "camera_height": 480,
+  "jpeg_quality": 75,
+  "policy_camera_keys": [
+    "camera1",
+    "camera2",
+    "camera3"
+  ],
+  "cameras": [
+    {
+      "key": "camera1",
+      "title": "HEAD",
+      "serial": "260322274450"
+    },
+    {
+      "key": "camera2",
+      "title": "LEFT ARM",
+      "serial": "260322274992"
+    },
+    {
+      "key": "camera3",
+      "title": "RIGHT ARM",
+      "serial": "260322276006"
+    }
+  ],
+  "displayed_task": "Pick up the bowl and place it in the box.",
+  "displayed_model": "smolvla",
+  "web_version": "ai-v3",
+  "default_task_id": "bowl",
+  "stt": {
+    "enabled": true,
+    "endpoint": "http://localhost:8002",
+    "model": "small",
+    "device": "cuda",
+    "compute_type": "int8_float16",
+    "cpu_threads": 8,
+    "beam_size": 1,
+    "vad_filter": true,
+    "min_audio_seconds": 0.2,
+    "max_audio_seconds": 15,
+    "languages": [
+      "ko",
+      "en"
+    ],
+    "initial_prompt": {
+      "ko": "그릇을 집어줘. 컵을 집어줘. 멈춰. 종료해줘.",
+      "en": "Pick up the bowl. Pick up the cup. Stop. Terminate."
+    }
+  },
+  "voice": {
+    "vad": {
+      "min_rms": 0.012,
+      "noise_multiplier": 3.0,
+      "start_ms": 96,
+      "end_ms": 700,
+      "preroll_ms": 384,
+      "min_seconds": 0.25,
+      "max_seconds": 12
+    },
+    "action_words": {
+      "ko": [
+        "집어",
+        "잡아",
+        "들어",
+        "옮겨",
+        "시작",
+        "실행",
+        "해줘",
+        "해주세요"
+      ],
+      "en": [
+        "pick",
+        "pick up",
+        "grab",
+        "take",
+        "move",
+        "start",
+        "run",
+        "execute",
+        "please"
+      ]
+    },
+    "pause_words": {
+      "ko": [
+        "멈춰",
+        "멈춰줘",
+        "일시정지",
+        "잠깐 멈춰",
+        "그만",
+        "스톱"
+      ],
+      "en": [
+        "stop",
+        "pause",
+        "hold on",
+        "wait"
+      ]
+    },
+    "terminate_words": {
+      "ko": [
+        "종료",
+        "끝내"
+      ],
+      "en": [
+        "terminate",
+        "shut down",
+        "shutdown",
+        "quit",
+        "exit",
+        "end it"
+      ]
+    }
+  },
+  "tasks": [
+    {
+      "id": "bowl",
+      "number": 1,
+      "label": "BOWL",
+      "instruction": "Pick up the bowl and place it in the box.",
+      "voice_keywords": {
+        "ko": [
+          "보울",
+          "그릇",
+          "사발"
+        ],
+        "en": [
+          "bowl"
+        ]
+      },
+      "voice_response": {
+        "ko": "네, 정책을 실행합니다.",
+        "en": "Okay, running the policy."
+      }
+    },
+    {
+      "id": "cup",
+      "number": 2,
+      "label": "CUP",
+      "instruction": "Pick up the cup and place it in the box.",
+      "voice_keywords": {
+        "ko": [
+          "컵",
+          "잔",
+          "커피잔"
+        ],
+        "en": [
+          "cup",
+          "mug",
+          "glass"
+        ]
+      },
+      "voice_response": {
+        "ko": "네, 정책을 실행합니다.",
+        "en": "Okay, running the policy."
+      }
+    }
+  ]
+}

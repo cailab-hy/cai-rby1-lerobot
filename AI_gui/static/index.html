@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RB-Y1 AI Voice Control</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">VOICE INTELLIGENCE CONSOLE · AI V3</p>
+          <h1>RB-Y1 AI CONTROL</h1>
+        </div>
+        <div class="health">
+          <button id="langChip" class="chip lang-chip" type="button" title="AUTO / KO / EN">AUTO</button>
+          <span id="cameraSummary" class="chip">Cameras 0/3</span>
+          <span id="clientSummary" class="chip">Client stopped</span>
+        </div>
+      </header>
+
+      <section class="camera-grid" aria-label="Camera previews">
+        <article class="camera-card" data-camera="camera2">
+          <div class="camera-heading"><h2>LEFT ARM</h2><span class="camera-dot"></span></div>
+          <div class="camera-stage">
+            <img src="/camera/camera2.mjpg" alt="Left arm D405 stream" />
+            <div class="camera-overlay" data-i18n="camera.connecting">카메라 연결 중</div>
+          </div>
+          <p class="camera-meta">260322274992</p>
+        </article>
+        <article class="camera-card" data-camera="camera1">
+          <div class="camera-heading"><h2>HEAD</h2><span class="camera-dot"></span></div>
+          <div class="camera-stage">
+            <img src="/camera/camera1.mjpg" alt="Head D405 stream" />
+            <div class="camera-overlay" data-i18n="camera.connecting">카메라 연결 중</div>
+          </div>
+          <p class="camera-meta">260322274450</p>
+        </article>
+        <article class="camera-card" data-camera="camera3">
+          <div class="camera-heading"><h2>RIGHT ARM</h2><span class="camera-dot"></span></div>
+          <div class="camera-stage">
+            <img src="/camera/camera3.mjpg" alt="Right arm D405 stream" />
+            <div class="camera-overlay" data-i18n="camera.connecting">카메라 연결 중</div>
+          </div>
+          <p class="camera-meta">260322276006</p>
+        </article>
+      </section>
+
+      <section class="control-panel">
+        <div class="voice-console">
+          <div class="voice-copy">
+            <p class="voice-kicker">VOICE COMMAND</p>
+            <h2 id="voiceState">오브를 눌러 음성 정책 실행 모드로 전환하세요</h2>
+            <p id="voiceTranscript" class="voice-transcript">“그릇을 집어줘” 또는 “컵을 집어줘”</p>
+            <div class="command-examples">
+              <span data-i18n="example.bowl">그릇을 집어줘</span>
+              <span data-i18n="example.cup">컵을 집어줘</span>
+              <span class="stop-command" data-i18n="example.pause">멈춰 · 일시정지</span>
+              <span class="stop-command" data-i18n="example.terminate">종료해줘 · 완전 종료</span>
+            </div>
+          </div>
+
+          <button
+            id="voiceOrb"
+            class="voice-orb"
+            type="button"
+            data-i18n-aria="orb.ariaLabel"
+            aria-label="음성 인식 시작"
+            data-state="idle"
+          >
+            <span class="orb-aura"></span>
+            <span class="orb-ring ring-one"></span>
+            <span class="orb-ring ring-two"></span>
+            <span class="orb-core">
+              <span class="orb-wave"><i></i><i></i><i></i><i></i><i></i></span>
+            </span>
+          </button>
+
+          <div class="voice-detail">
+            <div>
+              <span class="detail-label">SELECTED TASK</span>
+              <strong id="selectedTaskLabel">BOWL</strong>
+            </div>
+            <div>
+              <span class="detail-label">POLICY INSTRUCTION</span>
+              <span id="taskValue">Loading…</span>
+            </div>
+          </div>
+        </div>
+
+        <aside class="system-panel">
+          <div class="field model-field">
+            <label>Inference Model</label>
+            <div id="modelValue" class="readonly">Loading…</div>
+          </div>
+          <div class="field">
+            <label>Microphone</label>
+            <div id="microphoneStatus" class="readonly status-value">Not activated</div>
+          </div>
+          <div class="field">
+            <label>Speech Recognition</label>
+            <div id="sttStatus" class="readonly status-value">Loading…</div>
+          </div>
+          <p class="voice-note" data-i18n="ui.note">
+            “멈춰”는 연결을 유지한 일시정지, “종료해줘”는 로봇 클라이언트 완전 종료입니다.
+          </p>
+        </aside>
+        <div class="actions">
+          <button id="reconnectButton" class="button secondary" data-i18n="ui.reconnect">↻ 카메라 다시 연결</button>
+          <div class="action-right">
+            <button id="startButton" class="button primary" data-i18n="ui.manualRun">▶ 선택 작업 수동 실행</button>
+            <button id="stopButton" class="button danger" data-i18n="ui.stopClient" disabled>■ 클라이언트 정지</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="log-panel">
+        <div class="section-title"><h2>Client Log</h2><span id="apiMessage"></span></div>
+        <pre id="logOutput" aria-live="polite"></pre>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
