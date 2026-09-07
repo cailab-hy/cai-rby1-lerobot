@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import sys
@@ -215,7 +216,37 @@ def install_relay_patch() -> None:
             return
         original_aggregate(self, incoming_actions, aggregate_fn, *args, **kwargs)
 
+    # v1.1 added a refill reservation to the observation path:
+    # _ready_to_send_observation() sets _refill_in_flight, and only
+    # control_loop_observation(..., force_refill=True) ever clears or confirms
+    # it. Omitting the argument strands the flag as True, no further
+    # observations are sent, the action queue drains and the robot stops after
+    # the first chunk. Detect the parameter so this shim works on versions
+    # that predate it too.
+    _observation_takes_force_refill = "force_refill" in inspect.signature(
+        client_module.RobotClient.control_loop_observation
+    ).parameters
+
+    def send_observation_for(self: Any, task: str, verbose: bool) -> Any:
+        if self.uses_grpc_backend:
+            if _observation_takes_force_refill:
+                return self.control_loop_observation(task, verbose, force_refill=True)
+            return self.control_loop_observation(task, verbose)
+        if self.uses_remote_zmq_backend:
+            return self.control_loop_remote_observation(task, verbose)
+        raise ValueError(f"Unsupported backend: {self.backend}")
+
     def patched_control_loop(self: Any, task: str, verbose: bool = False) -> tuple[Any, Any]:
+        # The high-rate loop is a separate implementation upstream; it does not
+        # go through this function, so voice pause cannot hook into it.
+        if getattr(self.config, "trajectory_postprocess", None) is not None and \
+                self.config.trajectory_postprocess.enabled:
+            self.logger.warning(
+                "trajectory_postprocess is enabled; AI GUI voice pause is inactive in the "
+                "high-rate control loop."
+            )
+            return self._high_rate_control_loop(task, verbose)
+
         if self.uses_grpc_backend or self.uses_remote_zmq_backend:
             self.start_barrier.wait()
 
@@ -248,12 +279,7 @@ def install_relay_patch() -> None:
                 performed_action = self.control_loop_action(verbose)
 
             if self._ready_to_send_observation():
-                if self.uses_grpc_backend:
-                    captured_observation = self.control_loop_observation(current_task, verbose)
-                elif self.uses_remote_zmq_backend:
-                    captured_observation = self.control_loop_remote_observation(current_task, verbose)
-                else:
-                    raise ValueError(f"Unsupported backend: {self.backend}")
+                captured_observation = send_observation_for(self, current_task, verbose)
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - loop_started) * 1000:.2f}")
             time.sleep(max(0, self.config.environment_dt - (time.perf_counter() - loop_started)))

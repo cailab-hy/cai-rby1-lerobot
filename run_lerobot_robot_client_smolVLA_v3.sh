@@ -3,7 +3,7 @@ set -euo pipefail
 
 lerobot-robot-client \
   --backend=grpc \
-  --server_address=192.168.1.9:8080 \
+  --server_address=192.168.1.3:8080 \
   --robot.type=rby1 \
   --robot.address=192.168.1.201:50051 \
   --robot.model=auto \
